@@ -49,6 +49,8 @@ save_trials(day)                             ← per day
 | `proc_reach.py` | `procReach.m` | updates `recNNN.Events.mat` |
 | `save_trials.py` | `dbdatabasePyTask.m` + `dbAlldatabasePyTask.m` | `DAY/mat/Trials.mat` (successful only), `DAY/mat/AllTrials.mat` (all trials) |
 
+Current AlexRig extension: `procThalamus_indie.py` also writes `bag/mat/joystick.mat` when a `Joystick` node is present.
+
 ---
 
 ## Key Technical Decisions
@@ -241,6 +243,58 @@ raw eye data can corrupt the mean, shifting the entire filtered trace by million
 **Fix**: Changed to `nanmedian`, matching the same fix applied to `procEye.m`.
 
 **Effect**: 260302 rec002 saccade detection restored. No change on other days.
+
+---
+
+## Joystick Support (Current State)
+
+### What is already done
+
+- The joystick task now emits only sparse canonical `BehavState` values for trial structure: `intertrial`, `start_on`, `success`, `fail`.
+- Rich within-trial joystick task events remain in `behav_result['attempts'][...]['events']`, including `target_on`, `first_joystick_movement`, `target_entry`, `target_exit`, `hold_start`, `hold_break`, `hold_complete`, `reward_triggered`, `bonus_reward_triggered`, `ignored_idle_timeout`, `free_play_start`, and `free_play_end_requested`.
+- The photodiode / display square is toggled only on `start_on`, so display matching should be used only to refine the true visual target-onset time.
+- `procThalamus_indie.py` now extracts the recorded `Joystick` analog node into `bag/mat/joystick.mat` as timestamped `x`/`y` samples, preserving every sample instead of collapsing by timestamp.
+
+### Current joystick contract
+
+- Primary continuous joystick source: recorded `Joystick` node from the behave bag.
+- Fallback / debugging source: task-side `behav_result['joystick_samples']` if needed, but this is not the preferred analysis source.
+- Saved intermediate file: `bag/mat/joystick.mat` with `header_stamp_sec`, `header_stamp_nanosec`, `x`, `y`.
+- These timestamps are still in task / ROS-side time and should be aligned later using `w_drift_ros`, just like other task-side modalities.
+
+### Ordered next steps to populate `Events.mat` with joystick task events
+
+1. Validate `joystick.mat` on a real recording day.
+   Check sample count, monotonic timestamps, and that movement is visible where expected.
+2. Confirm the `Joystick` node timestamp semantics.
+   Verify whether `record.time` corresponds to the first sample in a packet, last sample, or packet emission time.
+3. Add a joystick processing module analogous to `proc_hand.py`.
+   It should load `joystick.mat`, apply `w_drift_ros`, and optionally resample to a regular grid for trial slicing.
+4. Decide which joystick-derived events should be authoritative in `Events.mat`.
+   Recommended first pass: keep `StartOn` display-confirmed, and use task-emitted `target_entry`, `hold_start`, and `hold_complete` from `behav_result` rather than re-detecting them immediately from the continuous trace.
+5. Extend `proc_events.py` to parse joystick-task `behav_result` and populate new joystick-related fields in `Events.mat`.
+   Candidate fields depend on analysis needs, but the likely first additions are target-entry and hold timing fields.
+6. Only after step 5, consider offline re-derivation of joystick events from the continuous trace if validation shows task-emitted events are insufficient.
+
+### Recommended field policy
+
+- `StartOn`: display-confirmed via photodiode / `proc_display.py`.
+- `Success` / `Fail`: task-controller timed.
+- `target_entry`, `hold_start`, `hold_complete`: initially task-emitted from `behav_result`.
+- Continuous joystick trajectory: derived from `joystick.mat` after clock alignment.
+
+### Resume checklist for a future session
+
+When resuming joystick work, inspect these in order:
+
+1. `proc/PyTaskCtrl/py_proc/procThalamus_indie.py`
+   Confirm `joystick.mat` is being written and sample counts look correct.
+2. `proc/PyTaskCtrl/py_proc/pre_proc.py`
+   Confirm sparse joystick task `BehavState` values produce valid trials.
+3. `proc/PyTaskCtrl/py_proc/proc_events.py`
+   This is where joystick task events from `behav_result` will eventually be promoted into `Events.mat`.
+4. One real processed recording
+   Compare `start_on`, photodiode events, and joystick movement timing on the same trial.
 
 ---
 
