@@ -254,6 +254,16 @@ raw eye data can corrupt the mean, shifting the entire filtered trace by million
 - Rich within-trial joystick task events remain in `behav_result['attempts'][...]['events']`, including `target_on`, `first_joystick_movement`, `target_entry`, `target_exit`, `hold_start`, `hold_break`, `hold_complete`, `reward_triggered`, `bonus_reward_triggered`, `ignored_idle_timeout`, `free_play_start`, and `free_play_end_requested`.
 - The photodiode / display square is toggled only on `start_on`, so display matching should be used only to refine the true visual target-onset time.
 - `procThalamus_indie.py` now extracts the recorded `Joystick` analog node into `bag/mat/joystick.mat` as timestamped `x`/`y` samples, preserving every sample instead of collapsing by timestamp.
+- `proc_events.py` now writes joystick-related fields into `Events.mat` / `AllTrials.mat` / `Trials.mat`:
+  `JoystickTargetOn`, `JoystickFirstMovement`, `JoystickTargetEntry`,
+  `JoystickTargetEntryFinal`, `JoystickTargetExit`, `JoystickTargetExitFinal`,
+  `JoystickHoldStart`, `JoystickHoldStartFinal`, `JoystickHoldBreak`,
+  `JoystickHoldBreakFinal`, `JoystickHoldComplete`, `JoystickReward`,
+  and `JoystickAttemptCount`.
+- A separate validation / visualization folder now exists at `pyCheck/`.
+  It reconstructs cursor position from `joystick.mat` using the real task logic in
+  `thalamus/task_controller/joystick_intro.py`, loads `AllTrials.mat`, and generates
+  timeseries / trajectory plots for inspection.
 
 ### Current joystick contract
 
@@ -262,19 +272,73 @@ raw eye data can corrupt the mean, shifting the entire filtered trace by million
 - Saved intermediate file: `bag/mat/joystick.mat` with `header_stamp_sec`, `header_stamp_nanosec`, `x`, `y`.
 - These timestamps are still in task / ROS-side time and should be aligned later using `w_drift_ros`, just like other task-side modalities.
 
-### Ordered next steps to populate `Events.mat` with joystick task events
+### Validation status on day `260324`
 
-1. Validate `joystick.mat` on a real recording day.
-   Check sample count, monotonic timestamps, and that movement is visible where expected.
-2. Confirm the `Joystick` node timestamp semantics.
-   Verify whether `record.time` corresponds to the first sample in a packet, last sample, or packet emission time.
-3. Add a joystick processing module analogous to `proc_hand.py`.
-   It should load `joystick.mat`, apply `w_drift_ros`, and optionally resample to a regular grid for trial slicing.
-4. Decide which joystick-derived events should be authoritative in `Events.mat`.
-   Recommended first pass: keep `StartOn` display-confirmed, and use task-emitted `target_entry`, `hold_start`, and `hold_complete` from `behav_result` rather than re-detecting them immediately from the continuous trace.
-5. Extend `proc_events.py` to parse joystick-task `behav_result` and populate new joystick-related fields in `Events.mat`.
-   Candidate fields depend on analysis needs, but the likely first additions are target-entry and hold timing fields.
-6. Only after step 5, consider offline re-derivation of joystick events from the continuous trace if validation shows task-emitted events are insufficient.
+- `260324` has now been processed both with and without video.
+- Video-enabled extraction completes successfully. On Windows systems without symlink privilege,
+  `procThalamus_indie.py` now falls back from symlink to normal file copy for the camera MP4s.
+- `joystick.mat` for `260324` contains `26030` samples, with monotonic timestamps and plausible
+  X/Y range.
+- `pyCheck` currently produces:
+  - joystick / cursor timeseries plots
+  - reconstructed cursor trajectory plots
+  - an alignment summary histogram
+  - a constant-shift sweep figure for debugging timestamp offsets
+- The **current plotting code is good enough for qualitative inspection**.
+  The timeseries and trajectory plots now use raw task attempt events from `behav_result`
+  as the primary annotation source, so repeated events such as `target_entry`, `target_exit`,
+  `target_entry_2`, `target_exit_2`, `target_entry_3`, etc. are visible at the correct
+  within-trial spacing.
+
+### Important current bug: processed joystick timestamps are wrong
+
+The main unresolved joystick bug is **not** in `pyCheck`. It is in the processed joystick timing
+written by `proc_events.py`.
+
+- The raw attempt events in `behav_result['final_attempt']['events']` appear internally correct.
+- The processed joystick fields written into `Events.mat` / `AllTrials.mat` are currently not
+  faithful reconstructions of those same times.
+- In practice, the processed joystick events are being collapsed toward trial end.
+
+#### Explicit example: `260324`, trial 4
+
+Raw task-side attempt events in `behav_result`:
+
+- `target_on` at `267.6161261`
+- `first_joystick_movement` at `268.015863697`
+- first `target_entry` at `268.671598189`
+- first `target_exit` at `268.999905054`
+- second `target_entry` at `269.380556159`
+- second `target_exit` at `269.79343992`
+- third `target_entry` at `270.226560467`
+- `hold_complete` / `reward_triggered` / `success` at `270.729022446`
+
+Processed joystick fields in `AllTrials.mat` for that same trial:
+
+- `JoystickTargetOn = 94127.028 ms` relative to `StartOn`
+- `JoystickFirstMovement = 94526.766 ms`
+- `JoystickTargetEntry = 95182.500 ms`
+- `JoystickTargetEntryFinal = 96737.463 ms`
+- `JoystickTargetExit = 95510.807 ms`
+- `JoystickTargetExitFinal = 96304.342 ms`
+- `JoystickHoldComplete = 97239.925 ms`
+
+When those processed values are converted back into task time, they land near:
+
+- `JoystickTargetOn ≈ 270.754 s`
+- `JoystickFirstMovement ≈ 270.767 s`
+- `JoystickTargetEntry ≈ 270.789 s`
+
+This is wrong. Trial 4 should span about **3.1 s from `target_on` to `success`**, with multiple
+entries and exits spread across that interval. Instead, the processed joystick fields compress those
+events into the final ~100 ms before success.
+
+**Interpretation**:
+
+- `joystick.mat` sample indexing appears usable enough for plotting.
+- Raw attempt event timing in `behav_result` appears sensible.
+- The bug is in how those raw attempt events are promoted into processed recorder-aligned
+  `Joystick*` fields in `proc_events.py`.
 
 ### Recommended field policy
 
@@ -289,12 +353,26 @@ When resuming joystick work, inspect these in order:
 
 1. `proc/PyTaskCtrl/py_proc/procThalamus_indie.py`
    Confirm `joystick.mat` is being written and sample counts look correct.
+   Also confirm the Windows video-link fallback still works (`copyfile` fallback when symlink fails).
 2. `proc/PyTaskCtrl/py_proc/pre_proc.py`
    Confirm sparse joystick task `BehavState` values produce valid trials.
 3. `proc/PyTaskCtrl/py_proc/proc_events.py`
-   This is where joystick task events from `behav_result` will eventually be promoted into `Events.mat`.
-4. One real processed recording
-   Compare `start_on`, photodiode events, and joystick movement timing on the same trial.
+   This is the main joystick bug location right now.
+   The code that promotes `behav_result` attempt events into processed `Joystick*` fields is not correct.
+4. `pyCheck/joystick_validation.py`
+   Use this as the current ground-truth inspection tool.
+   The plots look okay now because they use raw `behav_result` attempt events for annotation.
+5. One real processed recording with video, currently `260324`
+   Compare:
+   - photodiode / `start_on`
+   - visible cursor movement in video
+   - raw `behav_result['final_attempt']['events']`
+   - processed `Joystick*` fields in `AllTrials.mat`
+6. Keep the `260324`, trial 4 example in mind
+   This is the clearest explicit failure case:
+   raw events show repeated exit / re-entry over ~3.1 s, while processed joystick fields are compressed near trial end.
+7. Do **not** treat the processed `Joystick*` fields as trustworthy until this is fixed
+   For debugging and plotting, prefer raw attempt events from `behav_result`.
 
 ---
 
@@ -306,3 +384,7 @@ When resuming joystick work, inspect these in order:
   genuinely ambiguous; they just pick differently.
 - **`MONKEYDIR` portability**: All pipeline functions take `monkeydir` as an explicit parameter.
   Only the runner script (`p260303_procLoop.py`) has it hardcoded.
+- **Joystick processed timestamp bug**: `proc_events.py` currently writes incorrect recorder-aligned
+  `Joystick*` event times into `Events.mat` / `AllTrials.mat` / `Trials.mat`.
+  The clearest example is `260324` trial 4, where the raw attempt events span ~3.1 s with multiple
+  target exits and re-entries, but the processed joystick fields collapse those events toward trial end.

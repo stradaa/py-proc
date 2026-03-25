@@ -40,6 +40,8 @@ def rec_paths(day, rec, monkeydir):
 def load_experiment(rec_pref):
     """Load experiment struct from recNNN.experiment.mat."""
     exp_file = f'{rec_pref}.experiment.mat'
+    if not os.path.exists(exp_file):
+        return {}
     data = loadmat(exp_file, simplify_cells=True)
     return data.get('experiment', {})
 
@@ -53,6 +55,13 @@ def get_fs_rec(rec_pref):
             return float(acq[0]['samplingrate'])
         return float(acq['samplingrate'])
     except (KeyError, TypeError, IndexError):
+        rec_meta_file = f'{rec_pref}.recorder_meta.mat'
+        if os.path.exists(rec_meta_file):
+            rec_meta = loadmat(rec_meta_file, simplify_cells=True).get('rec_meta', {})
+            try:
+                return float(rec_meta['Fs_rec'])
+            except (KeyError, TypeError, ValueError):
+                pass
         return 30000.0
 
 

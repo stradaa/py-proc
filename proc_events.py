@@ -493,6 +493,20 @@ def _init_events(ntrials):
         'Pulse_width': _nan(n),
         'Pulse_start': _nan(n),
         'Pulse_end': _nan(n),
+        # Joystick task timing
+        'JoystickAttemptCount': _nan(n),
+        'JoystickTargetOn': _nan(n),
+        'JoystickFirstMovement': _nan(n),
+        'JoystickTargetEntry': _nan(n),
+        'JoystickTargetEntryFinal': _nan(n),
+        'JoystickTargetExit': _nan(n),
+        'JoystickTargetExitFinal': _nan(n),
+        'JoystickHoldStart': _nan(n),
+        'JoystickHoldStartFinal': _nan(n),
+        'JoystickHoldBreak': _nan(n),
+        'JoystickHoldBreakFinal': _nan(n),
+        'JoystickHoldComplete': _nan(n),
+        'JoystickReward': _nan(n),
         # Reach size
         'ReachSize': _nan(n),
     }
@@ -580,6 +594,10 @@ def _populate_behav_results(Events, itrial, trial_type, br_raw,
                              target_values, tc_struct):
     br = _parse_behav(br_raw)
     if not br:
+        return
+
+    if trial_type.startswith('joystick'):
+        _populate_joystick(Events, itrial, br)
         return
 
     if trial_type == 'luminance_reward_selection':
@@ -694,6 +712,87 @@ def _populate_lrs(Events, itrial, br, target_values):
     Events['ChosenTarget'][itrial] = float(ct) if ct is not None else np.nan
     rwd = br.get('reward_given', np.nan)
     Events['RewardReceived'][itrial] = float(rwd) if rwd is not None else np.nan
+
+
+def _populate_joystick(Events, itrial, br):
+    final_attempt = br.get('final_attempt')
+    if not isinstance(final_attempt, dict):
+        attempts = br.get('attempts', [])
+        if isinstance(attempts, list) and attempts:
+            final_attempt = attempts[-1]
+        else:
+            return
+
+    Events['JoystickAttemptCount'][itrial] = float(
+        br.get('trial_attempt_count', len(br.get('attempts', []))))
+
+    attempt_events = final_attempt.get('events', [])
+    if not isinstance(attempt_events, list) or not attempt_events:
+        return
+
+    end_ms = float(Events['End'][itrial]) if not np.isnan(Events['End'][itrial]) else np.nan
+    if np.isnan(end_ms):
+        return
+
+    end_names = {'success', 'fail'}
+    end_event = next(
+        (ev for ev in reversed(attempt_events)
+         if str(ev.get('name', '')).lower().strip() in end_names),
+        None)
+    if end_event is None:
+        end_rel_s = _safe_float(final_attempt.get('duration_s'))
+    else:
+        end_rel_s = _safe_float(end_event.get('time_since_attempt_start_s'))
+    if np.isnan(end_rel_s):
+        return
+
+    Events['Target'][itrial] = _safe_float(final_attempt.get('target_index'))
+    Events['RewardReceived'][itrial] = 1.0 if str(br.get('final_outcome', '')).lower() == 'success' else 0.0
+
+    Events['JoystickTargetOn'][itrial] = _joystick_event_time_ms(
+        attempt_events, 'target_on', end_ms, end_rel_s, first=True)
+    Events['JoystickFirstMovement'][itrial] = _joystick_event_time_ms(
+        attempt_events, 'first_joystick_movement', end_ms, end_rel_s, first=True)
+    Events['JoystickTargetEntry'][itrial] = _joystick_event_time_ms(
+        attempt_events, 'target_entry', end_ms, end_rel_s, first=True)
+    Events['JoystickTargetEntryFinal'][itrial] = _joystick_event_time_ms(
+        attempt_events, 'target_entry', end_ms, end_rel_s, first=False)
+    Events['JoystickTargetExit'][itrial] = _joystick_event_time_ms(
+        attempt_events, 'target_exit', end_ms, end_rel_s, first=True)
+    Events['JoystickTargetExitFinal'][itrial] = _joystick_event_time_ms(
+        attempt_events, 'target_exit', end_ms, end_rel_s, first=False)
+    Events['JoystickHoldStart'][itrial] = _joystick_event_time_ms(
+        attempt_events, 'hold_start', end_ms, end_rel_s, first=True)
+    Events['JoystickHoldStartFinal'][itrial] = _joystick_event_time_ms(
+        attempt_events, 'hold_start', end_ms, end_rel_s, first=False)
+    Events['JoystickHoldBreak'][itrial] = _joystick_event_time_ms(
+        attempt_events, 'hold_break', end_ms, end_rel_s, first=True)
+    Events['JoystickHoldBreakFinal'][itrial] = _joystick_event_time_ms(
+        attempt_events, 'hold_break', end_ms, end_rel_s, first=False)
+    Events['JoystickHoldComplete'][itrial] = _joystick_event_time_ms(
+        attempt_events, 'hold_complete', end_ms, end_rel_s, first=True)
+    Events['JoystickReward'][itrial] = _joystick_event_time_ms(
+        attempt_events, 'reward_triggered', end_ms, end_rel_s, first=True)
+
+
+def _joystick_event_time_ms(attempt_events, event_name, end_ms, end_rel_s, first=True):
+    matches = []
+    for ev in attempt_events:
+        name = str(ev.get('name', '')).lower().strip()
+        rel_s = _safe_float(ev.get('time_since_attempt_start_s'))
+        if name == event_name and not np.isnan(rel_s):
+            matches.append(rel_s)
+    if not matches:
+        return np.nan
+    rel_s = matches[0] if first else matches[-1]
+    return float(end_ms + 1e3 * (rel_s - end_rel_s))
+
+
+def _safe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return np.nan
 
 
 # ---------------------------------------------------------------------------

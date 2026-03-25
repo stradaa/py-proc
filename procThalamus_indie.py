@@ -25,6 +25,8 @@ import scipy.io
 from thalamus.thalamus_pb2 import StorageRecord, Image, Compressed
 import google.protobuf.message
 
+# python procThalamus_indie.py -d 260324 --skip-video
+
 EXECUTABLE_EXTENSION = '.exe' if sys.platform == 'win32' else ''
 
 LONG = ">Q"
@@ -930,9 +932,14 @@ def main():
         image_path = img_dir / node / 'image.mp4'
         image_path.parent.mkdir(exist_ok=True, parents=True)
         image_path.unlink(missing_ok=True)
-        # Symlink instead of move to preserve original
-        image_path.symlink_to(mp4_file.resolve())
-        print(f'Video: linked {mp4_file} -> {image_path}')
+        # Prefer a symlink to preserve the original file, but fall back to copy
+        # on Windows systems without symlink privileges.
+        try:
+          image_path.symlink_to(mp4_file.resolve())
+          print(f'Video: linked {mp4_file} -> {image_path}')
+        except OSError:
+          shutil.copyfile(str(mp4_file), str(image_path))
+          print(f'Video: copied {mp4_file} -> {image_path}')
       else:
         print(f'WARNING: No MP4 file found for {node} rec {rec_int}')
 
