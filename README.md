@@ -289,60 +289,65 @@ raw eye data can corrupt the mean, shifting the entire filtered trace by million
   as the primary annotation source, so repeated events such as `target_entry`, `target_exit`,
   `target_entry_2`, `target_exit_2`, `target_entry_3`, etc. are visible at the correct
   within-trial spacing.
+- `proc_events.py` joystick event promotion has now been fixed:
+  processed `Joystick*` fields are generated from absolute task timestamps in
+  `behav_result['final_attempt']['events'][...]['time_perf_counter']`, aligned into recorder time
+  through `w_drift_ros`, instead of being reconstructed backwards from `End`.
+- On the explicit failure case `260324`, trial 4, all processed `Joystick*` fields now round-trip
+  back to the raw `behav_result` event times with `0.0 ms` error in `pyCheck`.
+- The remaining joystick timing concern is now **not** the processed `Joystick*` fields.
+  It is the relation between task `StartOn` and photodiode-confirmed `disStartOn`.
 
-### Important current bug: processed joystick timestamps are wrong
+### Current photodiode / target-onset status
 
-The main unresolved joystick bug is **not** in `pyCheck`. It is in the processed joystick timing
-written by `proc_events.py`.
+- `StartOn` and `disStartOn` are now intentionally kept separate.
+  `StartOn` remains the original task-controller timestamp from the `BehavState=start_on` event.
+  `disStartOn` stores the photodiode/display-matched timestamp from `proc_display.py`.
+- This is intentional: downstream analysis can choose whether to use task-side onset or
+  display-confirmed onset.
 
-- The raw attempt events in `behav_result['final_attempt']['events']` appear internally correct.
-- The processed joystick fields written into `Events.mat` / `AllTrials.mat` are currently not
-  faithful reconstructions of those same times.
-- In practice, the processed joystick events are being collapsed toward trial end.
+#### Current unresolved concern: `disStartOn` appears far too late
 
-#### Explicit example: `260324`, trial 4
+For `260324`, rec `001`, the currently matched display onset is much later than the task-side
+`StartOn`. Example first five trials:
 
-Raw task-side attempt events in `behav_result`:
+- trial 1: `disStartOn - StartOn = 941 ms`
+- trial 2: `1227 ms`
+- trial 3: `1519 ms`
+- trial 4: `1428 ms`
+- trial 5: `1680 ms`
 
-- `target_on` at `267.6161261`
-- `first_joystick_movement` at `268.015863697`
-- first `target_entry` at `268.671598189`
-- first `target_exit` at `268.999905054`
-- second `target_entry` at `269.380556159`
-- second `target_exit` at `269.79343992`
-- third `target_entry` at `270.226560467`
-- `hold_complete` / `reward_triggered` / `success` at `270.729022446`
+Across all 30 trials on this rec:
 
-Processed joystick fields in `AllTrials.mat` for that same trial:
+- median `disStartOn - StartOn`: `1219 ms`
+- mean: `1206 ms`
+- range: `641–1680 ms`
 
-- `JoystickTargetOn = 94127.028 ms` relative to `StartOn`
-- `JoystickFirstMovement = 94526.766 ms`
-- `JoystickTargetEntry = 95182.500 ms`
-- `JoystickTargetEntryFinal = 96737.463 ms`
-- `JoystickTargetExit = 95510.807 ms`
-- `JoystickTargetExitFinal = 96304.342 ms`
-- `JoystickHoldComplete = 97239.925 ms`
+This is implausibly large if the photodiode square really turns on in the same rendered frame as
+the target. A normal monitor / photodiode lag should be on the order of tens of milliseconds, not
+~1 second.
 
-When those processed values are converted back into task time, they land near:
+#### What has been ruled out so far
 
-- `JoystickTargetOn ≈ 270.754 s`
-- `JoystickFirstMovement ≈ 270.767 s`
-- `JoystickTargetEntry ≈ 270.789 s`
-
-This is wrong. Trial 4 should span about **3.1 s from `target_on` to `success`**, with multiple
-entries and exits spread across that interval. Instead, the processed joystick fields compress those
-events into the final ~100 ms before success.
+- The joystick `Joystick*` fields are no longer the source of the problem; they match raw
+  `behav_result` timing correctly.
+- The `disStartOn - StartOn` offset does **not** show a meaningful linear drift across trials.
+  A least-squares fit versus trial number gives approximately:
+  `slope = -1.67 ms / trial`, `R^2 = 0.0028`.
+- The offset also does **not** correlate meaningfully with absolute recording time or trial duration.
+- Around each task `StartOn`, the raw thresholded display trace currently shows only one detectable
+  transition within `±2 s`, and it is the late one currently being matched.
 
 **Interpretation**:
 
-- `joystick.mat` sample indexing appears usable enough for plotting.
-- Raw attempt event timing in `behav_result` appears sensible.
-- The bug is in how those raw attempt events are promoted into processed recorder-aligned
-  `Joystick*` fields in `proc_events.py`.
+- The present `disStartOn` values should **not** yet be trusted as the true visual onset.
+- The remaining problem is likely in photodiode/display detection or display-event matching,
+  not in joystick event promotion.
 
 ### Recommended field policy
 
-- `StartOn`: display-confirmed via photodiode / `proc_display.py`.
+- `StartOn`: original task-controller `start_on` event.
+- `disStartOn`: separate photodiode / display-confirmed onset from `proc_display.py`.
 - `Success` / `Fail`: task-controller timed.
 - `target_entry`, `hold_start`, `hold_complete`: initially task-emitted from `behav_result`.
 - Continuous joystick trajectory: derived from `joystick.mat` after clock alignment.
@@ -357,8 +362,9 @@ When resuming joystick work, inspect these in order:
 2. `proc/PyTaskCtrl/py_proc/pre_proc.py`
    Confirm sparse joystick task `BehavState` values produce valid trials.
 3. `proc/PyTaskCtrl/py_proc/proc_events.py`
-   This is the main joystick bug location right now.
-   The code that promotes `behav_result` attempt events into processed `Joystick*` fields is not correct.
+   Confirm the fixed joystick event-promotion path is still intact:
+   `Joystick*` fields should be generated from absolute `time_perf_counter` values and aligned via
+   `w_drift_ros`, not reconstructed backwards from `End`.
 4. `pyCheck/joystick_validation.py`
    Use this as the current ground-truth inspection tool.
    The plots look okay now because they use raw `behav_result` attempt events for annotation.
@@ -369,10 +375,13 @@ When resuming joystick work, inspect these in order:
    - raw `behav_result['final_attempt']['events']`
    - processed `Joystick*` fields in `AllTrials.mat`
 6. Keep the `260324`, trial 4 example in mind
-   This is the clearest explicit failure case:
-   raw events show repeated exit / re-entry over ~3.1 s, while processed joystick fields are compressed near trial end.
-7. Do **not** treat the processed `Joystick*` fields as trustworthy until this is fixed
-   For debugging and plotting, prefer raw attempt events from `behav_result`.
+   This is still the best concrete trial to compare across:
+   task `StartOn`, `disStartOn`, raw `behav_result` joystick events, `joystick.mat`, and video.
+7. Inspect the raw display signal around trial onset
+   Determine whether the matched edge is really the photodiode square turning on, or whether the
+   current threshold / matching logic is locking onto the wrong transition.
+8. Do **not** treat `disStartOn` as trustworthy visual onset until the large `~1.2 s` offset is explained
+   For now, retain both task `StartOn` and photodiode `disStartOn` and compare them explicitly.
 
 ---
 
@@ -384,7 +393,8 @@ When resuming joystick work, inspect these in order:
   genuinely ambiguous; they just pick differently.
 - **`MONKEYDIR` portability**: All pipeline functions take `monkeydir` as an explicit parameter.
   Only the runner script (`p260303_procLoop.py`) has it hardcoded.
-- **Joystick processed timestamp bug**: `proc_events.py` currently writes incorrect recorder-aligned
-  `Joystick*` event times into `Events.mat` / `AllTrials.mat` / `Trials.mat`.
-  The clearest example is `260324` trial 4, where the raw attempt events span ~3.1 s with multiple
-  target exits and re-entries, but the processed joystick fields collapse those events toward trial end.
+- **Photodiode / display onset mismatch on joystick day `260324`**:
+  `disStartOn` is now being populated for `joystick_intro`, but the matched photodiode onset is
+  implausibly late relative to task `StartOn` (median ~1219 ms, range 641–1680 ms on rec `001`).
+  This does not show a simple linear drift across trials, so the likely remaining issue is in
+  display signal interpretation or event matching rather than joystick event timing.

@@ -55,12 +55,21 @@ _DISPLAY_STATES_BY_TASK = {
         {'start_on', 'success'},
     'simple_saccade_touch_task':
         {'start_on', 'success'},
+    'joystick_intro':
+        {'start_on'},
     'luminance_reward_selection':
         {'start_on', 'go', 'success'},
     'calibrate_eye_reach':
         {'start_on', 'targs_on', 'go', 'success'},
     'calibrate_eye_saccade':
         {'start_on', 'targs_on', 'go', 'success'},
+}
+
+_MAX_LATENCY_BY_TASK = {
+    # Joystick target onset is the display event of interest, but on current
+    # recordings the detected photodiode edge can arrive > 0.4 s after the
+    # task-side start_on timestamp, so use a wider search window.
+    'joystick_intro': 2.0,
 }
 
 
@@ -159,7 +168,7 @@ def proc_display(day, rec, monkeydir, out_suffix=''):
     displayLatencyAcrossStates = []
     conv_corr_arr = np.zeros(numtrials)
     missing_states = np.zeros(numtrials)
-    max_latency = 0.4  # seconds
+    default_max_latency = 0.4  # seconds
     min_event_interval = 0.01  # seconds
 
     for iTr in range(numtrials):
@@ -178,6 +187,7 @@ def proc_display(day, rec, monkeydir, out_suffix=''):
 
         trial_type = tc_struct.get('task_type', '')
         display_states = _DISPLAY_STATES_BY_TASK.get(trial_type, set())
+        max_latency = _MAX_LATENCY_BY_TASK.get(trial_type, default_max_latency)
 
         # Get task-controller event times for this trial (seconds)
         trial_events = ev[iTr]['events']

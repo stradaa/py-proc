@@ -40,6 +40,9 @@ def proc_events(day, rec, monkeydir, use_display=True, out_suffix=''):
 
     # ---- Clock alignment (AlexRig single-clock shortcut) --------------------
     _compute_and_save_alignment(rec_pref, py_pref, Fs_rec, bag_dir)
+    align_data = loadmat(f'{py_pref}.w_alignment.mat', simplify_cells=True)
+    w_drift_ros = np.asarray(
+        align_data.get('w_drift_ros', [np.nan, np.nan]), dtype=float).ravel()
 
     # ---- Pre-process (state → ev.mat) ----------------------------------------
     pre_proc(day, rec, monkeydir, out_suffix)
@@ -152,10 +155,7 @@ def proc_events(day, rec, monkeydir, use_display=True, out_suffix=''):
 
         # StartOn: prefer display time, fall back to task controller
         dis_StartOn = _disp_ev_time(start_names)
-        if not np.isnan(dis_StartOn):
-            Events['StartOn'][itrial] = dis_StartOn
-        else:
-            Events['StartOn'][itrial] = StartTrial
+        Events['StartOn'][itrial] = StartTrial
         Events['disStartOn'][itrial] = dis_StartOn
 
         # ---- start_gaze_on (doublestep_saccade_and_touch_sequence) -----------
@@ -226,7 +226,7 @@ def proc_events(day, rec, monkeydir, use_display=True, out_suffix=''):
         br = behav_results[itrial] if itrial < len(behav_results) else None
         if trial_type != 'null' and br:
             _populate_behav_results(Events, itrial, trial_type, br,
-                                    target_values, tc_struct)
+                                    target_values, tc_struct, w_drift_ros)
 
         # ---- TargSeq ---------------------------------------------------------
         if trial_type != 'null' and target_values:
@@ -591,13 +591,13 @@ def _parse_behav(br):
 
 
 def _populate_behav_results(Events, itrial, trial_type, br_raw,
-                             target_values, tc_struct):
+                             target_values, tc_struct, w_drift_ros):
     br = _parse_behav(br_raw)
     if not br:
         return
 
     if trial_type.startswith('joystick'):
-        _populate_joystick(Events, itrial, br)
+        _populate_joystick(Events, itrial, br, w_drift_ros)
         return
 
     if trial_type == 'luminance_reward_selection':
@@ -714,7 +714,7 @@ def _populate_lrs(Events, itrial, br, target_values):
     Events['RewardReceived'][itrial] = float(rwd) if rwd is not None else np.nan
 
 
-def _populate_joystick(Events, itrial, br):
+def _populate_joystick(Events, itrial, br, w_drift_ros):
     final_attempt = br.get('final_attempt')
     if not isinstance(final_attempt, dict):
         attempts = br.get('attempts', [])
@@ -730,62 +730,103 @@ def _populate_joystick(Events, itrial, br):
     if not isinstance(attempt_events, list) or not attempt_events:
         return
 
+    start_perf_s = _safe_float(final_attempt.get('start_time_perf_counter'))
+    end_perf_s = _safe_float(final_attempt.get('end_time_perf_counter'))
+    if np.isnan(end_perf_s):
+        end_names = {'success', 'fail'}
+        end_event = next(
+            (ev for ev in reversed(attempt_events)
+             if str(ev.get('name', '')).lower().strip() in end_names),
+            None)
+        if isinstance(end_event, dict):
+            end_perf_s = _safe_float(end_event.get('time_perf_counter'))
     end_ms = float(Events['End'][itrial]) if not np.isnan(Events['End'][itrial]) else np.nan
-    if np.isnan(end_ms):
-        return
-
-    end_names = {'success', 'fail'}
-    end_event = next(
-        (ev for ev in reversed(attempt_events)
-         if str(ev.get('name', '')).lower().strip() in end_names),
-        None)
-    if end_event is None:
-        end_rel_s = _safe_float(final_attempt.get('duration_s'))
-    else:
-        end_rel_s = _safe_float(end_event.get('time_since_attempt_start_s'))
+    end_rel_s = _safe_float(final_attempt.get('duration_s'))
     if np.isnan(end_rel_s):
-        return
+        end_names = {'success', 'fail'}
+        end_event = next(
+            (ev for ev in reversed(attempt_events)
+             if str(ev.get('name', '')).lower().strip() in end_names),
+            None)
+        if isinstance(end_event, dict):
+            end_rel_s = _safe_float(end_event.get('time_since_attempt_start_s'))
 
     Events['Target'][itrial] = _safe_float(final_attempt.get('target_index'))
     Events['RewardReceived'][itrial] = 1.0 if str(br.get('final_outcome', '')).lower() == 'success' else 0.0
 
     Events['JoystickTargetOn'][itrial] = _joystick_event_time_ms(
-        attempt_events, 'target_on', end_ms, end_rel_s, first=True)
+        attempt_events, 'target_on', w_drift_ros, start_perf_s, end_perf_s,
+        end_ms, end_rel_s, first=True)
     Events['JoystickFirstMovement'][itrial] = _joystick_event_time_ms(
-        attempt_events, 'first_joystick_movement', end_ms, end_rel_s, first=True)
+        attempt_events, 'first_joystick_movement', w_drift_ros, start_perf_s,
+        end_perf_s, end_ms, end_rel_s, first=True)
     Events['JoystickTargetEntry'][itrial] = _joystick_event_time_ms(
-        attempt_events, 'target_entry', end_ms, end_rel_s, first=True)
+        attempt_events, 'target_entry', w_drift_ros, start_perf_s, end_perf_s,
+        end_ms, end_rel_s, first=True)
     Events['JoystickTargetEntryFinal'][itrial] = _joystick_event_time_ms(
-        attempt_events, 'target_entry', end_ms, end_rel_s, first=False)
+        attempt_events, 'target_entry', w_drift_ros, start_perf_s, end_perf_s,
+        end_ms, end_rel_s, first=False)
     Events['JoystickTargetExit'][itrial] = _joystick_event_time_ms(
-        attempt_events, 'target_exit', end_ms, end_rel_s, first=True)
+        attempt_events, 'target_exit', w_drift_ros, start_perf_s, end_perf_s,
+        end_ms, end_rel_s, first=True)
     Events['JoystickTargetExitFinal'][itrial] = _joystick_event_time_ms(
-        attempt_events, 'target_exit', end_ms, end_rel_s, first=False)
+        attempt_events, 'target_exit', w_drift_ros, start_perf_s, end_perf_s,
+        end_ms, end_rel_s, first=False)
     Events['JoystickHoldStart'][itrial] = _joystick_event_time_ms(
-        attempt_events, 'hold_start', end_ms, end_rel_s, first=True)
+        attempt_events, 'hold_start', w_drift_ros, start_perf_s, end_perf_s,
+        end_ms, end_rel_s, first=True)
     Events['JoystickHoldStartFinal'][itrial] = _joystick_event_time_ms(
-        attempt_events, 'hold_start', end_ms, end_rel_s, first=False)
+        attempt_events, 'hold_start', w_drift_ros, start_perf_s, end_perf_s,
+        end_ms, end_rel_s, first=False)
     Events['JoystickHoldBreak'][itrial] = _joystick_event_time_ms(
-        attempt_events, 'hold_break', end_ms, end_rel_s, first=True)
+        attempt_events, 'hold_break', w_drift_ros, start_perf_s, end_perf_s,
+        end_ms, end_rel_s, first=True)
     Events['JoystickHoldBreakFinal'][itrial] = _joystick_event_time_ms(
-        attempt_events, 'hold_break', end_ms, end_rel_s, first=False)
+        attempt_events, 'hold_break', w_drift_ros, start_perf_s, end_perf_s,
+        end_ms, end_rel_s, first=False)
     Events['JoystickHoldComplete'][itrial] = _joystick_event_time_ms(
-        attempt_events, 'hold_complete', end_ms, end_rel_s, first=True)
+        attempt_events, 'hold_complete', w_drift_ros, start_perf_s, end_perf_s,
+        end_ms, end_rel_s, first=True)
     Events['JoystickReward'][itrial] = _joystick_event_time_ms(
-        attempt_events, 'reward_triggered', end_ms, end_rel_s, first=True)
+        attempt_events, 'reward_triggered', w_drift_ros, start_perf_s,
+        end_perf_s, end_ms, end_rel_s, first=True)
 
 
-def _joystick_event_time_ms(attempt_events, event_name, end_ms, end_rel_s, first=True):
+def _joystick_event_time_ms(attempt_events, event_name, w_drift_ros, start_perf_s,
+                            end_perf_s, end_ms, end_rel_s, first=True):
     matches = []
     for ev in attempt_events:
         name = str(ev.get('name', '')).lower().strip()
-        rel_s = _safe_float(ev.get('time_since_attempt_start_s'))
-        if name == event_name and not np.isnan(rel_s):
-            matches.append(rel_s)
+        if name == event_name and isinstance(ev, dict):
+            matches.append(ev)
     if not matches:
         return np.nan
-    rel_s = matches[0] if first else matches[-1]
-    return float(end_ms + 1e3 * (rel_s - end_rel_s))
+    event = matches[0] if first else matches[-1]
+
+    abs_perf_s = _safe_float(event.get('time_perf_counter'))
+    if np.isnan(abs_perf_s):
+        rel_s = _safe_float(event.get('time_since_attempt_start_s'))
+        if not np.isnan(rel_s) and not np.isnan(start_perf_s):
+            abs_perf_s = start_perf_s + rel_s
+        elif not np.isnan(rel_s) and not np.isnan(end_perf_s) and not np.isnan(end_rel_s):
+            abs_perf_s = end_perf_s + (rel_s - end_rel_s)
+
+    if not np.isnan(abs_perf_s) and _has_valid_alignment(w_drift_ros):
+        return _task_s_to_rec_ms(abs_perf_s, w_drift_ros)
+
+    rel_s = _safe_float(event.get('time_since_attempt_start_s'))
+    if (not np.isnan(rel_s) and not np.isnan(end_ms) and not np.isnan(end_rel_s)):
+        return float(end_ms + 1e3 * (rel_s - end_rel_s))
+    return np.nan
+
+
+def _has_valid_alignment(w_drift_ros):
+    return isinstance(w_drift_ros, np.ndarray) and w_drift_ros.size >= 2 and np.all(
+        np.isfinite(w_drift_ros[:2]))
+
+
+def _task_s_to_rec_ms(task_s, w_drift_ros):
+    return float(1e3 * (w_drift_ros[0] + w_drift_ros[1] * task_s))
 
 
 def _safe_float(value):
