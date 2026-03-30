@@ -4,9 +4,9 @@ Python port of the MATLAB v7 pipeline (`/vol/brains/raid/analyze/proc/PyTaskCtrl
 Produces identical output file formats so existing MATLAB analysis scripts continue to work.
 
 Written by Indie Garwood using [Claude Code](https://claude.ai/claude-code) (Anthropic).
-
 Created: 2026-03-04
 
+Forked 2026-03-24 and modified for joystick behavior support by Alex Estrada.
 ---
 
 ## Pipeline Overview

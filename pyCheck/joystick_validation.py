@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
+from matplotlib.animation import FFMpegWriter
 from matplotlib.transforms import blended_transform_factory
 import numpy as np
 import yaml
@@ -530,6 +531,139 @@ def build_validation_report(
         json.dump(summary, fh, indent=2)
 
     return summary
+
+
+def parse_trial_tokens(trial_tokens: Optional[Sequence[str]]) -> Optional[List[int]]:
+    if not trial_tokens:
+        return None
+    out: List[int] = []
+    for token in trial_tokens:
+        if "," in token:
+            parts = [p.strip() for p in token.split(",") if p.strip()]
+            parsed = parse_trial_tokens(parts)
+            if parsed:
+                out.extend(parsed)
+            continue
+        if "-" in token:
+            start_s, end_s = token.split("-", 1)
+            start_i = int(start_s)
+            end_i = int(end_s)
+            step = 1 if end_i >= start_i else -1
+            out.extend(list(range(start_i, end_i + step, step)))
+        else:
+            out.append(int(token))
+    deduped = []
+    for trial in out:
+        if trial not in deduped:
+            deduped.append(trial)
+    return deduped
+
+
+def render_trial_replay_video(
+    repo_root: str | Path,
+    day: str,
+    rec: str,
+    trial_numbers: Sequence[int],
+    out_path: str | Path,
+    fps: int = 30,
+    playback_speed: float = 1.0,
+    figsize: Tuple[float, float] = (7.5, 7.5),
+) -> Path:
+    dataset = load_joystick_dataset(repo_root, day, rec)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    trial_indices = [int(t) - 1 for t in trial_numbers]
+    fig, ax = plt.subplots(figsize=figsize)
+    writer = FFMpegWriter(fps=fps, codec="libx264", bitrate=4000)
+
+    with writer.saving(fig, str(out_path), dpi=140):
+        for trial_index in trial_indices:
+            segment = get_trial_segment(dataset, trial_index, pre_s=0.2, post_s=0.3)
+            render_trial_segment(segment, fig, ax, writer, fps=fps, playback_speed=playback_speed)
+
+    plt.close(fig)
+    return out_path
+
+
+def render_trial_segment(
+    segment: TrialSegment,
+    fig: plt.Figure,
+    ax: plt.Axes,
+    writer: FFMpegWriter,
+    fps: int,
+    playback_speed: float,
+) -> None:
+    playback_speed = max(1e-3, float(playback_speed))
+    dt_frame = playback_speed / float(fps)
+    target_on_event = select_attempt_event(segment.attempt, "target_on", "first")
+    end_name = "success" if str(segment.attempt.get("outcome", "")).lower() == "success" else "fail"
+    end_event = select_attempt_event(segment.attempt, end_name, "last")
+    target_on_time = float(target_on_event["time_perf_counter"]) if target_on_event is not None else segment.task_time_s[0]
+    end_time = float(end_event["time_perf_counter"]) if end_event is not None else segment.task_time_s[-1]
+    frame_times = np.arange(segment.task_time_s[0], segment.task_time_s[-1] + dt_frame, dt_frame)
+    labeled_events = iter_labeled_attempt_events(segment.attempt)
+
+    for t_now in frame_times:
+        ax.clear()
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.0)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.2)
+        ax.set_xlabel("cursor_x (task-region normalized)")
+        ax.set_ylabel("cursor_y (task-region normalized)")
+        ax.set_title(f"Trial {segment.trial_index + 1}")
+
+        if t_now >= target_on_time:
+            target = plt.Circle((segment.target_x, segment.target_y), segment.target_radius, color="#4caf50", alpha=0.2)
+            ax.add_patch(target)
+
+        visible_mask = segment.task_time_s <= t_now
+        if np.count_nonzero(visible_mask) >= 2:
+            ax.plot(segment.cursor_x[visible_mask], segment.cursor_y[visible_mask], color="#1f77b4", linewidth=2.2)
+
+        cx = float(np.interp(t_now, segment.task_time_s, segment.cursor_x))
+        cy = float(np.interp(t_now, segment.task_time_s, segment.cursor_y))
+        ax.scatter([cx], [cy], s=110, color="#d62728", edgecolor="black", linewidth=0.8, zorder=5)
+
+        shown_events = [ev for ev in labeled_events if ev["time_perf_counter"] <= t_now]
+        for ev in shown_events:
+            ex = float(np.interp(ev["time_perf_counter"], segment.task_time_s, segment.cursor_x))
+            ey = float(np.interp(ev["time_perf_counter"], segment.task_time_s, segment.cursor_y))
+            ax.scatter([ex], [ey], s=28, color=ev["color"], edgecolor="black", linewidth=0.4, zorder=4)
+
+        current_event = shown_events[-1]["label"] if shown_events else "pre_target"
+        status = (
+            f"time from target_on: {t_now - target_on_time:+.3f} s\n"
+            f"trial outcome: {segment.attempt.get('outcome', '')}\n"
+            f"current event: {current_event}"
+        )
+        ax.text(
+            0.02,
+            0.98,
+            status,
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=10,
+            bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "#cccccc"},
+        )
+
+        if t_now >= end_time:
+            ax.text(
+                0.98,
+                0.98,
+                "trial end",
+                transform=ax.transAxes,
+                va="top",
+                ha="right",
+                fontsize=11,
+                color="#222222",
+                bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "#cccccc"},
+            )
+
+        fig.tight_layout()
+        writer.grab_frame()
 
 
 def summarize_validation_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
