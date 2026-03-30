@@ -6,6 +6,14 @@ from pathlib import Path
 import subprocess
 import sys
 
+# Skip video extraction
+# .venv\Scripts\python.exe run_day_pipeline.py --day-dir "/vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/260323" --skip-video
+
+# Skip redoing video if camera outputs already exist
+# .venv\Scripts\python.exe run_day_pipeline.py --day-dir "/vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/260323" --skip-existing-video
+
+# Only do extraction + no-display Events pass + save_trials
+# .venv\Scripts\python.exe run_day_pipeline.py --day-dir "/vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/260323" --no-display
 
 def _bootstrap_local_package(repo_root: Path):
     spec = importlib.util.spec_from_file_location(
