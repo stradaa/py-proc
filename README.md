@@ -7,6 +7,7 @@ Written by Indie Garwood using [Claude Code](https://claude.ai/claude-code) (Ant
 Created: 2026-03-04
 
 Forked 2026-03-24 and modified for joystick behavior support by Alex Estrada.
+
 ---
 
 ## Pipeline Overview
