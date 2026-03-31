@@ -313,21 +313,28 @@ def load_ev_mat(rec_pref):
     # ev: MATLAB struct array → list of dicts
     ev_raw = data.get('ev', [])
     ev = []
-    if hasattr(ev_raw, '__len__') and len(ev_raw) > 0:
-        if isinstance(ev_raw[0], dict):
-            for e in ev_raw:
-                events = e.get('events', [])
-                if not isinstance(events, list):
-                    if isinstance(events, np.ndarray):
-                        events = events.tolist()
-                    else:
-                        events = [events]
-                ev.append({
-                    'trialNumber': int(e.get('trialNumber', 0)),
-                    'events': events,
-                    'eventTimes': np.asarray(e.get('eventTimes', []), dtype=float).ravel(),
-                    'trialresult': e.get('trialresult', ''),
-                })
+    if isinstance(ev_raw, dict):
+        ev_iter = [ev_raw]
+    elif hasattr(ev_raw, '__len__') and len(ev_raw) > 0:
+        ev_iter = ev_raw
+    else:
+        ev_iter = []
+
+    for e in ev_iter:
+        if not isinstance(e, dict):
+            continue
+        events = e.get('events', [])
+        if not isinstance(events, list):
+            if isinstance(events, np.ndarray):
+                events = events.tolist()
+            else:
+                events = [events]
+        ev.append({
+            'trialNumber': int(e.get('trialNumber', 0)),
+            'events': events,
+            'eventTimes': np.asarray(e.get('eventTimes', []), dtype=float).ravel(),
+            'trialresult': e.get('trialresult', ''),
+        })
 
     state_ts_rec = np.asarray(data.get('state_ts_rec', []), dtype=float).ravel()
     i_complete_starts = np.asarray(data.get('i_complete_starts', []), dtype=int).ravel() - 1  # 0-based

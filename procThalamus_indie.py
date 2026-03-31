@@ -440,6 +440,11 @@ def get_rec_number(path: pathlib.Path):
   else:
     return int(path.suffix[1:])
 
+def get_capture_stem(path: pathlib.Path):
+  if path.suffix == '.novideo':
+    return path.with_suffix('').name
+  return path.name
+
 def main():
   parser = argparse.ArgumentParser(
                     prog='Thalamus file hydrater (AlexRig)',
@@ -453,7 +458,7 @@ def main():
 
   print(args)
 
-  recs: typing.List[pathlib.Path] = []
+  recs_by_stem: typing.Dict[str, pathlib.Path] = {}
   behave_configs: typing.Dict[str, typing.Any] = {}
   bad_recs = []
   for f in day_dir.iterdir():
@@ -461,13 +466,18 @@ def main():
     if f.name.startswith('behave') and f.suffix == '.json':
       with open(f) as config_file:
         try:
-          behave_configs[f.with_suffix('').name + ('.novideo' if args.skip_video else '')] = json.load(config_file)
+          behave_configs[f.with_suffix('').name] = json.load(config_file)
         except json.JSONDecodeError:
           bad_recs.append(f.with_suffix(''))
-    elif f.name.startswith('behave') and is_capturefile(f) and ((f.suffix == '.novideo') if args.skip_video else (f.suffix != '.novideo')):
-      recs.append(f)
-  recs = set(recs) - set(bad_recs)
-  recs = sorted(recs, key=lambda r: r.name)
+    elif f.name.startswith('behave') and is_capturefile(f):
+      if f.suffix == '.novideo':
+        recs_by_stem[f.with_suffix('').name] = f
+      elif not args.skip_video or f.name not in recs_by_stem:
+        # When --skip-video is set, prefer an existing .novideo sidecar but
+        # fall back to the original capture file if no sidecar exists.
+        recs_by_stem[f.name] = f
+  recs = [rec for stem, rec in recs_by_stem.items() if day_dir / f'{stem}.json' not in bad_recs]
+  recs = sorted(recs, key=lambda r: get_rec_number(r))
   print('recs:', recs)
   print('configs:', list(behave_configs.keys()))
 
@@ -542,7 +552,8 @@ def main():
   print('Measure time')
   rec_times: typing.List[typing.Tuple[int, int]] = []
   for rec in recs:
-    behave_config = behave_configs[rec.name] if rec.name in behave_configs else list(behave_configs.values())[0]
+    rec_stem = get_capture_stem(rec)
+    behave_config = behave_configs[rec_stem] if rec_stem in behave_configs else list(behave_configs.values())[0]
 
     # Find touch transform — must be the TOUCH_SCREEN node whose Source is 'Node 2'
     # (the calibrated node driven by the Windows remote).  The vestigial 'Touch Screen'
