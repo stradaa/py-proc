@@ -137,13 +137,16 @@ def _parse_first_trial_config(bag_dir):
         raw = yaml.safe_load(fh)
 
     entries = raw if isinstance(raw, list) else [raw]
+    entries = [e for e in entries if e not in (None, '', [])]
+    if not entries:
+        return {}
     first = entries[0]
     if isinstance(first, str):
         try:
             first = json.loads(first)
         except Exception:
             first = yaml.safe_load(first)
-    return first
+    return first if isinstance(first, dict) else {}
 
 
 def get_gaze_transform(bag_dir):
@@ -152,6 +155,8 @@ def get_gaze_transform(bag_dir):
     Returns quadrant_gains: 2×4 float array (mm/input_unit).
     """
     cfg = _parse_first_trial_config(bag_dir)
+    if not cfg:
+        return np.ones((2, 4), dtype=float)
 
     gaze_tforms = np.array(cfg['gaze_tforms'], dtype=float)
     dpi = float(cfg['dpi'])

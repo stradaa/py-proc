@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from scipy.io import loadmat
+
 # Skip video extraction
 # python run_day_pipeline.py --day-dir "/vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/260323" --skip-video
 
@@ -14,6 +16,12 @@ import sys
 
 # Only do extraction + no-display Events pass + save_trials
 # python run_day_pipeline.py --day-dir "/vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/260323" --no-display
+
+# Process only rec005 for that day
+# python run_day_pipeline.py --day-dir "dir" --rec 005 --skip-video
+
+# Full path also works
+# python run_day_pipeline.py --day-dir "dir" --rec 005
 
 def _bootstrap_local_package(repo_root: Path):
     spec = importlib.util.spec_from_file_location(
@@ -27,6 +35,20 @@ def _bootstrap_local_package(repo_root: Path):
     sys.modules["py_proc"] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _events_trial_count(events_file: Path) -> int:
+    if not events_file.exists():
+        return 0
+    data = loadmat(events_file, simplify_cells=True)
+    events = data.get("Events", {})
+    if not events:
+        return 0
+    trial = events.get("Trial", [])
+    try:
+        return len(trial)
+    except TypeError:
+        return 0
 
 
 def main() -> None:
@@ -52,6 +74,11 @@ def main() -> None:
         "--no-display",
         action="store_true",
         help="Skip display correction and only run the no-display Events pass",
+    )
+    parser.add_argument(
+        "--rec",
+        default=None,
+        help="Optional single rec to process (e.g. 005). By default all recs in the day are processed.",
     )
     args = parser.parse_args()
 
@@ -86,6 +113,11 @@ def main() -> None:
     recs = get_recs(str(day_dir))
     if not recs:
         raise RuntimeError(f"No rec folders were created under {day_dir}")
+    if args.rec is not None:
+        rec = str(args.rec).zfill(3)
+        if rec not in recs:
+            raise RuntimeError(f"Requested rec {rec} not found under {day_dir}. Available recs: {', '.join(recs)}")
+        recs = [rec]
 
     print(f"\n=== Step 2: No-display Events pass for {len(recs)} rec(s) ===")
     for rec in recs:
@@ -98,6 +130,10 @@ def main() -> None:
         print(f"\n=== Step 4: Full per-rec processing ===")
         for rec in recs:
             proc_events(day, rec, str(monkeydir), use_display=True)
+            n_trials = _events_trial_count(day_dir / rec / f"rec{rec}.Events.mat")
+            if n_trials == 0:
+                print(f"rec{rec}: 0 trials after proc_events, skipping eye/saccade/hand/reach")
+                continue
             proc_eye(day, rec, str(monkeydir))
             proc_saccade(day, rec, str(monkeydir))
             proc_hand(day, rec, str(monkeydir))
