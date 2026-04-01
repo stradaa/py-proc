@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -31,6 +32,87 @@ def _rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
     window = max(1, min(int(window), len(values)))
     kernel = np.ones(window, dtype=float) / float(window)
     return np.convolve(values, kernel, mode="same")
+
+
+def _decode_json_stream(blob: str) -> List[dict]:
+    decoder = json.JSONDecoder()
+    out: List[dict] = []
+    i = 0
+    n = len(blob)
+    while i < n:
+        while i < n and blob[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        obj, j = decoder.raw_decode(blob, i)
+        if isinstance(obj, dict):
+            out.append(obj)
+        i = j
+    return out
+
+
+def _parse_target_config_entry(entry: object) -> List[dict]:
+    if isinstance(entry, np.ndarray):
+        entry = entry.tolist()
+    if isinstance(entry, list):
+        out: List[dict] = []
+        for item in entry:
+            out.extend(_parse_target_config_entry(item))
+        return out
+    if isinstance(entry, dict):
+        return [entry]
+    if not isinstance(entry, str) or not entry:
+        return []
+
+    try:
+        parsed = ast.literal_eval(entry)
+    except Exception:
+        parsed = entry
+
+    if isinstance(parsed, list):
+        text = "".join(str(x) for x in parsed)
+    else:
+        text = str(parsed)
+    try:
+        return _decode_json_stream(text)
+    except Exception:
+        return []
+
+
+def _target_center_for_trial(target_id: float, config_entry: object) -> Optional[dict]:
+    if not np.isfinite(target_id):
+        return None
+    targets = _parse_target_config_entry(config_entry)
+    if not targets:
+        return None
+
+    idx = int(round(float(target_id)))
+    if any(int(round(float(tid))) == 0 for tid in [target_id]):
+        zero_based = True
+    else:
+        zero_based = False
+
+    if zero_based:
+        target_idx = idx
+    else:
+        target_idx = idx - 1 if 1 <= idx <= len(targets) else idx
+
+    if target_idx < 0 or target_idx >= len(targets):
+        if 0 <= idx < len(targets):
+            target_idx = idx
+        else:
+            return None
+
+    target = targets[target_idx]
+    try:
+        return {
+            "x": float(target.get("x_norm", np.nan)),
+            "y": float(target.get("y_norm", np.nan)),
+            "radius": float(target.get("radius_ratio", np.nan)),
+            "name": str(target.get("name", target_idx)),
+        }
+    except Exception:
+        return None
 
 
 def plot_session_overview(data: Dict[str, np.ndarray], out_path: Path) -> Dict[str, Dict[str, float]]:
@@ -122,48 +204,191 @@ def plot_performance_over_time(data: Dict[str, np.ndarray], out_path: Path) -> D
 def plot_target_performance(data: Dict[str, np.ndarray], out_path: Path) -> Dict[str, Dict[str, float]]:
     target = _flat(data, "Target", float)
     success = _flat(data, "Success", float)
-    hold_complete = _flat(data, "JoystickHoldComplete", float)
+    config_entries = _flat(data, "TargetConfigs", object)
 
-    valid = np.isfinite(target)
-    targets = sorted(np.unique(target[valid]).astype(int).tolist())
-    counts = np.array([np.sum(target == t) for t in targets], dtype=float)
-    success_rate = np.array([np.nanmean(success[target == t]) for t in targets], dtype=float)
-    median_complete = np.array([
-        np.nanmedian(hold_complete[(target == t) & np.isfinite(hold_complete)])
-        if np.any((target == t) & np.isfinite(hold_complete)) else np.nan
-        for t in targets
-    ], dtype=float)
+    centers: Dict[tuple, Dict[str, float]] = {}
+    for target_id, cfg, succ in zip(target, config_entries, success):
+        info = _target_center_for_trial(target_id, cfg)
+        if info is None:
+            continue
+        x = info["x"]
+        y = info["y"]
+        r = info["radius"]
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        key = (round(x, 4), round(y, 4), round(r, 4), info["name"])
+        bucket = centers.setdefault(key, {
+            "x": x,
+            "y": y,
+            "radius": r if np.isfinite(r) else 0.06,
+            "name": info["name"],
+            "success": [],
+        })
+        bucket["success"].append(float(succ))
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True, height_ratios=[1, 1])
+    rows = list(centers.values())
+    xs = np.array([row["x"] for row in rows], dtype=float)
+    ys = np.array([row["y"] for row in rows], dtype=float)
+    rs = np.array([row["radius"] for row in rows], dtype=float)
+    counts = np.array([len(row["success"]) for row in rows], dtype=float)
+    success_rate = np.array([np.nanmean(row["success"]) for row in rows], dtype=float)
 
-    bar_colors = plt.cm.tab20(np.linspace(0, 1, len(targets)))
-    ax1.bar(targets, 100.0 * success_rate, color=bar_colors, alpha=0.9)
-    ax1.set_ylabel("Success rate (%)")
-    ax1.set_ylim(0, 105)
-    ax1.set_title("Target-wise performance (rec003 excluded)")
-    ax1.grid(axis="y", alpha=0.2)
+    gx = np.linspace(0.0, 1.0, 180)
+    gy = np.linspace(0.0, 1.0, 180)
+    X, Y = np.meshgrid(gx, gy)
+    sigma = max(0.06, float(np.nanmedian(rs[np.isfinite(rs)])) if np.isfinite(rs).any() else 0.08)
+    heat_num = np.zeros_like(X, dtype=float)
+    heat_den = np.zeros_like(X, dtype=float)
+    for x, y, c, s in zip(xs, ys, counts, success_rate):
+        weight = np.exp(-((X - x) ** 2 + (Y - y) ** 2) / (2.0 * sigma ** 2)) * max(c, 1.0)
+        heat_num += weight * s
+        heat_den += weight
+    heat = np.divide(heat_num, heat_den, out=np.full_like(heat_num, np.nan), where=heat_den > 0)
 
-    ax1b = ax1.twinx()
-    ax1b.plot(targets, counts, color="#222222", marker="o", linewidth=1.8)
-    ax1b.set_ylabel("Trial count")
+    density = np.zeros_like(X, dtype=float)
+    for x, y, c in zip(xs, ys, counts):
+        density += np.exp(-((X - x) ** 2 + (Y - y) ** 2) / (2.0 * sigma ** 2)) * max(c, 1.0)
 
-    ax2.bar(targets, median_complete, color=bar_colors, alpha=0.9)
-    ax2.set_xlabel("Target ID")
-    ax2.set_ylabel("Median hold-complete time (ms)")
-    ax2.grid(axis="y", alpha=0.2)
+    valid_success = success_rate[np.isfinite(success_rate)]
+    vmin = float(np.nanmin(valid_success)) if valid_success.size else 0.0
+    vmax = 1.0
 
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 5.8))
+
+    im = ax1.imshow(
+        heat,
+        origin="lower",
+        extent=(0.0, 1.0, 0.0, 1.0),
+        cmap="RdYlGn",
+        vmin=vmin,
+        vmax=vmax,
+        alpha=0.82,
+        aspect="equal",
+    )
+    for row, c, s in zip(rows, counts, success_rate):
+        circle = plt.Circle((row["x"], row["y"]), max(row["radius"], 0.02),
+                            edgecolor="black", facecolor="none", linewidth=1.1, alpha=0.8)
+        ax1.add_patch(circle)
+        ax1.text(row["x"], row["y"], f"{100.0 * s:.0f}%\n(n={int(c)})",
+                 ha="center", va="center", fontsize=7.5, color="black")
+    ax1.set_xlim(0.0, 1.0)
+    ax1.set_ylim(0.0, 1.0)
+    ax1.set_xlabel("Target center X (task space)")
+    ax1.set_ylabel("Target center Y (task space)")
+    ax1.set_title("Spatial success map")
+    ax1.grid(alpha=0.15)
+    cbar = fig.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
+    cbar.set_label(f"Success rate ({100.0 * vmin:.0f}% to 100%)")
+
+    im2 = ax2.imshow(
+        density,
+        origin="lower",
+        extent=(0.0, 1.0, 0.0, 1.0),
+        cmap="Blues",
+        alpha=0.88,
+        aspect="equal",
+    )
+    for row, c, s in zip(rows, counts, success_rate):
+        ax2.add_patch(plt.Circle((row["x"], row["y"]), max(row["radius"], 0.02),
+                                 edgecolor="#333333", facecolor="none", linewidth=1.0, alpha=0.65))
+        ax2.scatter(row["x"], row["y"], s=max(c, 1.0) * 14.0, color="#08306b", alpha=0.8)
+        ax2.text(row["x"], row["y"] - 0.045, f"{row['name']}\n n={int(c)}",
+                 ha="center", va="top", fontsize=7.5)
+    ax2.set_xlim(0.0, 1.0)
+    ax2.set_ylim(0.0, 1.0)
+    ax2.set_xlabel("Target center X (task space)")
+    ax2.set_ylabel("Target center Y (task space)")
+    ax2.set_title("Spatial trial density and target usage")
+    ax2.grid(alpha=0.15)
+    cbar2 = fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+    cbar2.set_label("Relative trial density")
+
+    fig.suptitle("Spatial target performance (rec003 excluded)")
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
 
     return {
-        str(t): {
+        row["name"]: {
+            "x": float(row["x"]),
+            "y": float(row["y"]),
+            "radius": float(row["radius"]),
             "trial_count": float(c),
             "success_rate": float(s),
-            "median_hold_complete_ms": float(m) if np.isfinite(m) else float("nan"),
         }
-        for t, c, s, m in zip(targets, counts, success_rate, median_complete)
+        for row, c, s in zip(rows, counts, success_rate)
     }
+
+
+def plot_success_failure_timing(data: Dict[str, np.ndarray], out_path: Path) -> Dict[str, Dict[str, float]]:
+    success = _flat(data, "Success", float)
+    fields = {
+        "First movement": 1e-3 * _flat(data, "JoystickFirstMovement", float),
+        "Target entry": 1e-3 * _flat(data, "JoystickTargetEntry", float),
+        "Hold complete": 1e-3 * _flat(data, "JoystickHoldComplete", float),
+        "Trial end": 1e-3 * _flat(data, "End", float),
+    }
+
+    labels = list(fields.keys())
+    success_data = []
+    failure_data = []
+    summary: Dict[str, Dict[str, float]] = {}
+
+    for label, arr in fields.items():
+        success_vals = arr[(success == 1) & np.isfinite(arr)]
+        failure_vals = arr[(success == 0) & np.isfinite(arr)]
+        success_data.append(success_vals)
+        failure_data.append(failure_vals)
+        summary[label] = {
+            "success_n": float(len(success_vals)),
+            "success_median_s": float(np.nanmedian(success_vals)) if len(success_vals) else float("nan"),
+            "failure_n": float(len(failure_vals)),
+            "failure_median_s": float(np.nanmedian(failure_vals)) if len(failure_vals) else float("nan"),
+        }
+
+    fig, ax = plt.subplots(figsize=(10.2, 5.4))
+    pos = np.arange(len(labels), dtype=float)
+
+    def _plot_group(groups: List[np.ndarray], positions: np.ndarray, face: str, edge: str) -> None:
+        valid_idx = [i for i, g in enumerate(groups) if len(g) > 0]
+        if valid_idx:
+            parts = ax.violinplot([groups[i] for i in valid_idx],
+                                  positions=positions[valid_idx],
+                                  widths=0.28,
+                                  showmedians=True)
+            for body in parts["bodies"]:
+                body.set_facecolor(face)
+                body.set_edgecolor(edge)
+                body.set_alpha(0.55)
+            parts["cmedians"].set_color(edge)
+
+    _plot_group(success_data, pos - 0.18, "#54a24b", "#1b5e20")
+    _plot_group(failure_data, pos + 0.18, "#e45756", "#7f0000")
+
+    for i, (svals, fvals) in enumerate(zip(success_data, failure_data)):
+        if len(svals):
+            ax.scatter(np.full(len(svals), pos[i] - 0.18), svals, s=8, alpha=0.15, color="#1b5e20")
+        if len(fvals):
+            ax.scatter(np.full(len(fvals), pos[i] + 0.18), fvals, s=8, alpha=0.15, color="#7f0000")
+
+    ax.set_xticks(pos)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Latency from StartOn (s)")
+    ax.set_title("Success vs failure timing (rec003 excluded)")
+    ax.grid(axis="y", alpha=0.2)
+
+    from matplotlib.lines import Line2D
+    legend_items = [
+        Line2D([0], [0], color="#54a24b", lw=8, alpha=0.6, label="Successful trials"),
+        Line2D([0], [0], color="#e45756", lw=8, alpha=0.6, label="Failed trials"),
+    ]
+    ax.legend(handles=legend_items, loc="upper left", frameon=False)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+    return summary
 
 
 def main() -> None:
@@ -197,6 +422,7 @@ def main() -> None:
         "session_overview": plot_session_overview(data, out_dir / f"{args.day}_overview_by_rec.png"),
         "performance_over_time": plot_performance_over_time(data, out_dir / f"{args.day}_performance_over_time.png"),
         "target_performance": plot_target_performance(data, out_dir / f"{args.day}_target_performance.png"),
+        "success_failure_timing": plot_success_failure_timing(data, out_dir / f"{args.day}_success_failure_timing.png"),
     }
 
     with open(out_dir / f"{args.day}_summary_metrics.json", "w", encoding="utf-8") as fh:

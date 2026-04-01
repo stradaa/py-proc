@@ -53,6 +53,10 @@ Replay examples:
 
 # Custom output path and frame rate
 .venv\Scripts\python.exe pyCheck\run_joystick_validation.py --day 260324 --skip-report --render-trials 4-5 --render-out pyCheck\output\260324\trial_replay_004_005.mp4 --fps 20
+
+Further optional statements and examples:
+  --out-dir /vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/python/alex/beh_joystick_analysis \
+  --exclude-recs 3
 ```
 
 Linux / shared-storage example:
