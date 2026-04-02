@@ -15,6 +15,61 @@ from scipy.io import loadmat, savemat
 from .helpers import rec_paths, load_w_alignment
 
 
+def _find_complete_trials_from_states(state_names, state_ts_rec, start_codes, end_codes):
+    """
+    Fallback matcher for sparse / irregular BehavState streams.
+
+    Build complete trials directly from START_* -> SUCCESS/FAIL sequences,
+    without requiring a clean INTERTRIAL-delimited interval for every trial.
+    """
+    start_end_pairs = []
+    start_indices = [i for i, s in enumerate(state_names) if s in start_codes]
+
+    for pos, start_idx in enumerate(start_indices):
+        next_start_idx = start_indices[pos + 1] if pos + 1 < len(start_indices) else len(state_names)
+        end_idx = next(
+            (i for i in range(start_idx + 1, next_start_idx) if state_names[i] in end_codes),
+            None,
+        )
+        if end_idx is None:
+            continue
+        start_end_pairs.append((start_idx, end_idx))
+
+    trial_windows = []
+    for pos, (start_idx, end_idx) in enumerate(start_end_pairs):
+        next_start_idx = start_end_pairs[pos + 1][0] if pos + 1 < len(start_end_pairs) else None
+        window_start = state_ts_rec[start_idx]
+        window_end = state_ts_rec[next_start_idx] if next_start_idx is not None else np.inf
+        trial_windows.append((window_start, window_end))
+
+    return start_end_pairs, trial_windows
+
+
+def _match_trial_summaries_to_windows(trial_summary_ts_rec, trial_windows, tol=0.050):
+    """
+    Match each complete trial to at most one monotonic trial_summary timestamp.
+
+    Trial summaries on AlexRig are often emitted near the trailing INTERTRIAL edge,
+    so we allow a small tolerance around the trial window boundaries.
+    """
+    matched = np.full(len(trial_windows), -1, dtype=int)
+    ts_idx = 0
+
+    for win_idx, (window_start, window_end) in enumerate(trial_windows):
+        while ts_idx < len(trial_summary_ts_rec):
+            ts_r = trial_summary_ts_rec[ts_idx]
+            if ts_r < (window_start - tol):
+                ts_idx += 1
+                continue
+            if ts_r <= (window_end + tol):
+                matched[win_idx] = ts_idx
+                ts_idx += 1
+                break
+            break
+
+    return matched
+
+
 def pre_proc(day, rec, monkeydir, out_suffix=''):
     """
     Port of preProcPyTask(day, rec).
@@ -167,6 +222,25 @@ def pre_proc(day, rec, monkeydir, out_suffix=''):
 
     i_complete_starts = np.array(i_complete_starts, dtype=int)
     i_complete_ends = np.array(i_complete_ends, dtype=int)
+
+    # Sparse / irregular state streams can produce legitimate complete trials
+    # even when the intertrial-based matching above fails to assign summaries.
+    if len(i_complete_starts) == 0 and len(trial_summary_ts_rec) > 0:
+        fallback_pairs, fallback_windows = _find_complete_trials_from_states(
+            state_names, state_ts_rec, start_codes, end_codes)
+        fallback_matches = _match_trial_summaries_to_windows(
+            trial_summary_ts_rec, fallback_windows)
+
+        matched_fallback = [(pair, match_idx) for pair, match_idx in zip(fallback_pairs, fallback_matches)
+                            if match_idx >= 0]
+        if matched_fallback:
+            print(f'  Fallback trial matching recovered {len(matched_fallback)} trials '
+                  f'from sparse/irregular state transitions.')
+            i_complete_starts = np.array([pair[0] for pair, _ in matched_fallback], dtype=int)
+            i_complete_ends = np.array([pair[1] for pair, _ in matched_fallback], dtype=int)
+            valid_trial_mask = np.zeros(len(trial_results), dtype=bool)
+            for _, match_idx in matched_fallback:
+                valid_trial_mask[match_idx] = True
 
     # Filter trial data to valid trials only
     trial_config = [tc for tc, v in zip(trial_config, valid_trial_mask) if v]

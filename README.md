@@ -399,3 +399,99 @@ When resuming joystick work, inspect these in order:
   implausibly late relative to task `StartOn` (median ~1219 ms, range 641–1680 ms on rec `001`).
   This does not show a simple linear drift across trials, so the likely remaining issue is in
   display signal interpretation or event matching rather than joystick event timing.
+
+---
+
+## Patch Notes: Trial Recovery Fix for Day `260402`
+
+### Symptom
+
+- `check_processability.py` reported that the raw `behave.*` files for day `260402` were
+  processable.
+- But `run_day_pipeline.py` later produced `0 trials` for both `rec001` and `rec002`.
+- This looked contradictory at first, because both recordings clearly contained embedded
+  `BehavState` messages and task-summary JSON records.
+
+### What was actually happening
+
+- `check_processability.py` only answers a narrow question:
+  "Does the raw capture contain the minimum text streams needed for the pipeline?"
+- It marks a recording as processable if it finds:
+  - at least one `BehavState=...` text record
+  - at least one task-summary JSON record
+- That check does **not** guarantee that `pre_proc.py` can reconstruct complete trials.
+
+- The real failure happened later inside `pre_proc.py`.
+- The original trial matcher expected a fairly strict structure:
+  - trials were separated cleanly by `INTERTRIAL`
+  - each intertrial-delimited span contained exactly one start state
+  - each such span also contained exactly one end state (`SUCCESS` or `FAIL`)
+  - each `trial_summary` timestamp landed strictly inside one intertrial interval
+
+### Why day `260402` broke that logic
+
+#### `rec001`
+
+- The extracted state stream looked like:
+  `start_on -> success -> intertrial -> start_on -> success -> intertrial -> ...`
+- So the recording began with a real trial **before** the first `intertrial`.
+- The original code only built trial windows from one `intertrial` to the next.
+- That meant the first real trial had no valid leading intertrial window.
+- Also, the `trial_summary` timestamps for this day landed right at or very near the trailing
+  `intertrial`, so the strict `t_start < ts < t_end` test could fail even for valid trials.
+
+#### `rec002`
+
+- The extracted state stream included real started trials, but also extra sparse fragments like:
+  `FAIL -> INTERTRIAL -> pulse_end`
+- Those fragments created intertrial-delimited spans with unexpected numbers of starts or ends.
+- The original code rejected any span that did not have exactly one start and exactly one end.
+- As a result, valid trials were present in the data, but the strict interval-based screening
+  threw them away.
+
+### Root cause
+
+- The original `pre_proc.py` trial reconstruction was too rigid for sparse / irregular
+  AlexRig `BehavState` streams.
+- In other words:
+  the raw files were processable,
+  but the trial-building logic was stricter than the actual state patterns being emitted.
+
+### Fix applied
+
+- Added a fallback trial-recovery path in `pre_proc.py`.
+- The original intertrial-based logic is still attempted first.
+- If that logic finds zero complete trials, the new fallback now:
+  - scans the state stream directly for `START_* -> SUCCESS/FAIL` sequences
+  - builds trial windows from each start state to the next start state
+  - matches `trial_summary` timestamps monotonically into those windows
+  - allows a small time tolerance near the window boundary so summaries that land near the
+    trailing `INTERTRIAL` are not dropped
+
+### Why this fix is safe
+
+- It only activates when the original logic collapses to zero trials.
+- So ordinary recordings that already match the original MATLAB-style assumptions keep using the
+  old path unchanged.
+- The fallback is specifically there for sparse or irregular state streams like the ones seen on
+  `260402`.
+
+### Validation on `260402`
+
+- In-memory validation against the extracted bag/YAML/MAT files showed:
+  - `rec001`: `5` trials recovered
+  - `rec002`: `4` trials recovered
+- That confirms the issue was not missing raw text data.
+- The issue was trial reconstruction in `pre_proc.py`.
+
+### Practical takeaway
+
+- `check_processability.py` means:
+  "the raw capture contains enough embedded text to attempt processing"
+- It does **not** mean:
+  "the current trial matcher will definitely recover trials"
+- If this mismatch appears again in the future, inspect `pre_proc.py` first, especially the
+  assumptions about:
+  - leading / trailing `INTERTRIAL`
+  - exact one-start / one-end trial spans
+  - strict timestamp containment inside intertrial windows
