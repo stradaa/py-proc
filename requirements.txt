@@ -11,4 +11,3 @@ PyQt6
 #   python3 -m venv .venv
 #   . .venv/bin/activate
 #   pip install -r requirements.txt
-#   export PYTHONPATH="/vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/python/alex/broker_work/bmbi-src:$PYTHONPATH"
