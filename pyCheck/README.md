@@ -18,6 +18,10 @@ Tools in this folder:
   Generates presentation-style day summaries directly from `AllTrials.mat`, such as:
   `*_overview_by_rec.png`, `*_performance_over_time.png`, `*_target_performance.png`, and `*_summary_metrics.json`.
 
+Optional GUI:
+- `proc_gui/run_gui.py`
+  Launches a PyQt6 front end for selecting day/rec, generating validation or day-summary plots, and browsing the resulting PNGs.
+
 Usage:
 
 ```powershell
@@ -27,7 +31,7 @@ Usage:
 Outputs are written by default to:
 
 ```text
-pyCheck/output/<DAY>/
+/vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/claude/figures/<DAY>/beh
 ```
 
 Typical files:
@@ -40,7 +44,8 @@ Important path note:
 - `run_joystick_validation.py` assumes `--repo-root` points at the day-data root that contains folders like `260331/`, not necessarily this code repository.
 - For AlexRig days stored under `/vol/cortex/.../Bowser_Behavior_AlexRig/`, pass:
   `--repo-root /vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig`
-- If that root is read-only, also pass a writable `--out-dir`.
+- You can also pass `--day-dir /vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/260331`.
+- If that figures root is read-only, also pass a writable `--out-dir`.
 
 Replay examples:
 
@@ -57,6 +62,12 @@ Replay examples:
 Further optional statements and examples:
   --out-dir /vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/python/alex/beh_joystick_analysis \
   --exclude-recs 3
+
+# Updated 
+> python pyCheck/run_joystick_validation.py --day-dir /vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/260402 --rec 001
+
+> python pyCheck/day_presentation_plots.py  --day-dir /vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/260331 \
+  --task-types joystick_intro
 ```
 
 Linux / shared-storage example:
@@ -68,7 +79,17 @@ Linux / shared-storage example:
   --rec 005 \
   --skip-report \
   --render-trials 1 2 3 4 5 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 \
-  --render-out /vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/python/alex/beh_joystick_analysis/260331_rec005_first20_successful_reaches.mp4
+  --render-out /vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/claude/figures/260331/beh/trial_replay_260331_005.mp4
+```
+
+Equivalent direct day-directory usage:
+
+```bash
+./.venv/bin/python pyCheck/run_joystick_validation.py \
+  --day-dir /vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/260331 \
+  --rec 005 \
+  --skip-report \
+  --render-trials 1 2 3 4 5
 ```
 
 Presentation plot example:
@@ -77,17 +98,40 @@ Presentation plot example:
 ./.venv/bin/python pyCheck/day_presentation_plots.py \
   --repo-root /vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig \
   --day 260331 \
-  --out-dir /vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/python/alex/beh_joystick_analysis \
   --exclude-recs 3
 ```
 
-This writes:
+Equivalent direct day-directory usage:
+
+```bash
+./.venv/bin/python pyCheck/day_presentation_plots.py \
+  --day-dir /vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/260331 \
+  --exclude-recs 3
+```
+
+Task-filtered usage:
+
+```bash
+./.venv/bin/python pyCheck/day_presentation_plots.py \
+  --day-dir /vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/260331 \
+  --task-types joystick_intro
+```
+
+By default this writes into:
+- `/vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig/claude/figures/260331/beh`
+
+Inside that folder it writes:
 - `260331_overview_by_rec.png`
 - `260331_performance_over_time.png`
+- `260331_display_alignment.png`
 - `260331_target_performance.png`
 - `260331_summary_metrics.json`
 
 Notes:
+- `--out-dir` is optional; if provided, it overrides the default `claude/figures/<day>/beh` path.
+- `--task-types` filters trials by exact `AllTrials.PyTaskType` value, so mixed-task recordings can be summarized without excluding entire recs.
+- `run_joystick_validation.py` now defaults both report figures and replay videos into the same `claude/figures/<day>/beh` folder used by `day_presentation_plots.py`.
+- `display_alignment.png` summarizes `AllTrials.disStartOn`, which is already stored relative to `StartOn` in milliseconds.
 - `--render-trials` accepts ranges like `10-20`, discrete integers like `4 7 12`, or comma-separated tokens.
 - Output is a single concatenated MP4 replaying the selected trials in order.
 - The replay is based on reconstructed cursor position from `joystick.mat`, not the camera video.

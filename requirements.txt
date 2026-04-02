@@ -5,6 +5,7 @@ PyYAML
 matplotlib
 protobuf
 thalamus-neuro
+PyQt6
 
 # Example:
 #   python3 -m venv .venv

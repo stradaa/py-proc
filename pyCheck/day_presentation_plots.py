@@ -4,7 +4,7 @@ import argparse
 import ast
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -115,7 +115,58 @@ def _target_center_for_trial(target_id: float, config_entry: object) -> Optional
         return None
 
 
-def plot_session_overview(data: Dict[str, np.ndarray], out_path: Path) -> Dict[str, Dict[str, float]]:
+def _title_suffix(exclude_recs: List[int]) -> str:
+    if not exclude_recs:
+        return ""
+    rec_text = ", ".join(f"rec{rec:03d}" for rec in sorted(exclude_recs))
+    plural = "s" if len(exclude_recs) > 1 else ""
+    return f" (excluded rec{plural}: {rec_text})"
+
+
+def _save_figure(fig: plt.Figure, out_path: Path, label: str) -> None:
+    print(f"Generating figure: {label}")
+    fig.savefig(out_path, dpi=180)
+    print(f"Saved figure: {out_path}")
+    plt.close(fig)
+
+
+def _longest_success_streak(success: np.ndarray) -> Dict[str, float]:
+    best = 0
+    current = 0
+    best_end = -1
+    for i, value in enumerate(np.asarray(success, dtype=float)):
+        if np.isfinite(value) and value >= 0.5:
+            current += 1
+            if current > best:
+                best = current
+                best_end = i
+        else:
+            current = 0
+
+    if best <= 0:
+        return {
+            "length": 0.0,
+            "start_trial_index_in_rec": float("nan"),
+            "end_trial_index_in_rec": float("nan"),
+            "render_trial_range": "",
+        }
+
+    start_idx = best_end - best + 2
+    end_idx = best_end + 1
+    return {
+        "length": float(best),
+        "start_trial_index_in_rec": float(start_idx),
+        "end_trial_index_in_rec": float(end_idx),
+        "render_trial_range": f"{start_idx}-{end_idx}",
+    }
+
+
+def plot_session_overview(
+    data: Dict[str, np.ndarray],
+    out_path: Path,
+    day: str,
+    exclude_recs: List[int],
+) -> Dict[str, Dict[str, float]]:
     rec = _flat(data, "Rec", int)
     success = _flat(data, "Success", float)
 
@@ -127,7 +178,7 @@ def plot_session_overview(data: Dict[str, np.ndarray], out_path: Path) -> Dict[s
     bars = ax.bar(recs, counts, color="#5b8def", alpha=0.9, width=0.7)
     ax.set_xlabel("Recording")
     ax.set_ylabel("Trial count")
-    ax.set_title("260331 joystick trials by recording")
+    ax.set_title(f"{day} joystick trials by recording{_title_suffix(exclude_recs)}")
     ax.set_xticks(recs)
     ax.grid(axis="y", alpha=0.2)
 
@@ -141,19 +192,24 @@ def plot_session_overview(data: Dict[str, np.ndarray], out_path: Path) -> Dict[s
                  ha="center", va="bottom", fontsize=9, color="#7f2704")
 
     fig.tight_layout()
-    fig.savefig(out_path, dpi=180)
-    plt.close(fig)
+    _save_figure(fig, out_path, "session overview")
 
-    return {
-        str(r): {
+    summary: Dict[str, Dict[str, object]] = {}
+    for r, c, s in zip(recs, counts, success_rate):
+        streak = _longest_success_streak(success[rec == r])
+        summary[str(r)] = {
             "trial_count": float(c),
             "success_rate": float(s),
+            "longest_consecutive_success_streak": streak,
         }
-        for r, c, s in zip(recs, counts, success_rate)
-    }
+    return summary
 
 
-def plot_performance_over_time(data: Dict[str, np.ndarray], out_path: Path) -> Dict[str, float]:
+def plot_performance_over_time(
+    data: Dict[str, np.ndarray],
+    out_path: Path,
+    exclude_recs: List[int],
+) -> Dict[str, float]:
     rec = _flat(data, "Rec", int)
     success = _flat(data, "Success", float)
     duration = _flat(data, "End", float)
@@ -176,7 +232,7 @@ def plot_performance_over_time(data: Dict[str, np.ndarray], out_path: Path) -> D
     ax1.scatter(order, 100.0 * success, c=[colors.get(int(r), "#777777") for r in rec], s=14, alpha=0.55)
     ax1.set_ylabel("Success (%)")
     ax1.set_ylim(-5, 105)
-    ax1.set_title("Performance over session (rec003 excluded)")
+    ax1.set_title(f"Performance over session{_title_suffix(exclude_recs)}")
     ax1.grid(alpha=0.2)
 
     for r in sorted(np.unique(rec)):
@@ -188,11 +244,10 @@ def plot_performance_over_time(data: Dict[str, np.ndarray], out_path: Path) -> D
     ax2.set_xlabel("Trial order across day")
     ax2.set_ylabel("Trial duration (ms)")
     ax2.grid(alpha=0.2)
-    ax2.legend(loc="upper right", ncol=3, fontsize=8, frameon=False)
+    ax2.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8, frameon=False, borderaxespad=0.0)
 
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=180)
-    plt.close(fig)
+    fig.tight_layout(rect=(0.0, 0.0, 0.84, 1.0))
+    _save_figure(fig, out_path, "performance over time")
 
     return {
         "overall_success_rate": float(np.nanmean(success)),
@@ -201,7 +256,11 @@ def plot_performance_over_time(data: Dict[str, np.ndarray], out_path: Path) -> D
     }
 
 
-def plot_target_performance(data: Dict[str, np.ndarray], out_path: Path) -> Dict[str, Dict[str, float]]:
+def plot_target_performance(
+    data: Dict[str, np.ndarray],
+    out_path: Path,
+    exclude_recs: List[int],
+) -> Dict[str, Dict[str, float]]:
     target = _flat(data, "Target", float)
     success = _flat(data, "Success", float)
     config_entries = _flat(data, "TargetConfigs", object)
@@ -303,10 +362,9 @@ def plot_target_performance(data: Dict[str, np.ndarray], out_path: Path) -> Dict
     cbar2 = fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
     cbar2.set_label("Relative trial density")
 
-    fig.suptitle("Spatial target performance (rec003 excluded)")
+    fig.suptitle(f"Spatial target performance{_title_suffix(exclude_recs)}")
     fig.tight_layout()
-    fig.savefig(out_path, dpi=180)
-    plt.close(fig)
+    _save_figure(fig, out_path, "target performance")
 
     return {
         row["name"]: {
@@ -320,7 +378,11 @@ def plot_target_performance(data: Dict[str, np.ndarray], out_path: Path) -> Dict
     }
 
 
-def plot_success_failure_timing(data: Dict[str, np.ndarray], out_path: Path) -> Dict[str, Dict[str, float]]:
+def plot_success_failure_timing(
+    data: Dict[str, np.ndarray],
+    out_path: Path,
+    exclude_recs: List[int],
+) -> Dict[str, Dict[str, float]]:
     success = _flat(data, "Success", float)
     fields = {
         "First movement": 1e-3 * _flat(data, "JoystickFirstMovement", float),
@@ -374,7 +436,7 @@ def plot_success_failure_timing(data: Dict[str, np.ndarray], out_path: Path) -> 
     ax.set_xticks(pos)
     ax.set_xticklabels(labels)
     ax.set_ylabel("Latency from StartOn (s)")
-    ax.set_title("Success vs failure timing (rec003 excluded)")
+    ax.set_title(f"Success vs failure timing{_title_suffix(exclude_recs)}")
     ax.grid(axis="y", alpha=0.2)
 
     from matplotlib.lines import Line2D
@@ -385,48 +447,211 @@ def plot_success_failure_timing(data: Dict[str, np.ndarray], out_path: Path) -> 
     ax.legend(handles=legend_items, loc="upper left", frameon=False)
 
     fig.tight_layout()
-    fig.savefig(out_path, dpi=180)
-    plt.close(fig)
+    _save_figure(fig, out_path, "success vs failure timing")
 
     return summary
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate presentation-style summary plots from AllTrials.mat")
-    parser.add_argument("--repo-root", required=True)
-    parser.add_argument("--day", required=True)
-    parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--exclude-recs", nargs="*", type=int, default=[])
-    args = parser.parse_args()
+def plot_display_alignment(
+    data: Dict[str, np.ndarray],
+    out_path: Path,
+    exclude_recs: List[int],
+) -> Dict[str, object]:
+    rec = _flat(data, "Rec", int)
+    display_latency_ms = _flat(data, "disStartOn", float)
+    valid = np.isfinite(display_latency_ms)
 
-    repo_root = Path(args.repo_root).resolve()
-    out_dir = Path(args.out_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(10.8, 7.4), height_ratios=[1.0, 1.15], sharex=False
+    )
 
-    data = _load_all_trials(repo_root, args.day)
-    if args.exclude_recs:
-        rec = _flat(data, "Rec", int)
-        keep = ~np.isin(rec, np.asarray(args.exclude_recs, dtype=int))
-        filtered: Dict[str, np.ndarray] = {}
-        for key, value in data.items():
-            arr = np.asarray(value)
-            if arr.ndim == 0:
-                filtered[key] = arr
-            elif arr.shape[0] == len(rec):
-                filtered[key] = arr[keep]
-            else:
-                filtered[key] = arr
-        data = filtered
+    valid_latency = display_latency_ms[valid]
+    if len(valid_latency):
+        bins = np.linspace(
+            float(np.nanmin(valid_latency)) - 2.5,
+            float(np.nanmax(valid_latency)) + 2.5,
+            min(40, max(12, int(np.sqrt(len(valid_latency)) * 3))),
+        )
+        ax1.hist(valid_latency, bins=bins, color="#4c78a8", alpha=0.85, edgecolor="white")
+        median_latency = float(np.nanmedian(valid_latency))
+        mean_latency = float(np.nanmean(valid_latency))
+        ax1.axvline(median_latency, color="#d95f02", linewidth=2, label=f"median {median_latency:.1f} ms")
+        ax1.axvline(mean_latency, color="#1b9e77", linewidth=1.8, linestyle="--", label=f"mean {mean_latency:.1f} ms")
+        ax1.legend(frameon=False, loc="upper right")
+    else:
+        median_latency = float("nan")
+        mean_latency = float("nan")
+        ax1.text(0.5, 0.5, "No valid disStartOn values", ha="center", va="center", transform=ax1.transAxes)
 
-    metrics = {
-        "session_overview": plot_session_overview(data, out_dir / f"{args.day}_overview_by_rec.png"),
-        "performance_over_time": plot_performance_over_time(data, out_dir / f"{args.day}_performance_over_time.png"),
-        "target_performance": plot_target_performance(data, out_dir / f"{args.day}_target_performance.png"),
-        "success_failure_timing": plot_success_failure_timing(data, out_dir / f"{args.day}_success_failure_timing.png"),
+    ax1.set_xlabel("disStartOn relative to StartOn (ms)")
+    ax1.set_ylabel("Trial count")
+    ax1.set_title(f"Display alignment latency distribution{_title_suffix(exclude_recs)}")
+    ax1.grid(axis="y", alpha=0.2)
+
+    recs = sorted(np.unique(rec).tolist())
+    rec_summary: Dict[str, Dict[str, float]] = {}
+    x_positions: List[float] = []
+    rec_groups: List[np.ndarray] = []
+    for i, r in enumerate(recs):
+        vals = display_latency_ms[(rec == r) & valid]
+        if len(vals):
+            rec_groups.append(vals)
+            x_positions.append(float(i + 1))
+        rec_summary[str(r)] = {
+            "n_valid": float(len(vals)),
+            "median_ms": float(np.nanmedian(vals)) if len(vals) else float("nan"),
+            "mean_ms": float(np.nanmean(vals)) if len(vals) else float("nan"),
+            "min_ms": float(np.nanmin(vals)) if len(vals) else float("nan"),
+            "max_ms": float(np.nanmax(vals)) if len(vals) else float("nan"),
+        }
+
+    if rec_groups:
+        parts = ax2.violinplot(rec_groups, positions=np.asarray(x_positions), widths=0.8, showmedians=True)
+        for body in parts["bodies"]:
+            body.set_facecolor("#72b7b2")
+            body.set_edgecolor("#1f4e79")
+            body.set_alpha(0.45)
+        parts["cmedians"].set_color("#1f4e79")
+
+        for x, vals in zip(x_positions, rec_groups):
+            jitter = np.linspace(-0.12, 0.12, len(vals)) if len(vals) > 1 else np.array([0.0])
+            ax2.scatter(np.full(len(vals), x) + jitter, vals, s=10, alpha=0.25, color="#0b3954")
+
+    ax2.axhline(50.0, color="#d95f02", linestyle="--", linewidth=1.5, alpha=0.9)
+    ax2.set_xticks(np.arange(1, len(recs) + 1, dtype=float))
+    ax2.set_xticklabels([f"rec{r:03d}" for r in recs], rotation=0)
+    ax2.set_ylabel("disStartOn relative to StartOn (ms)")
+    ax2.set_xlabel("Recording")
+    ax2.set_title("Per-recording display alignment")
+    ax2.grid(axis="y", alpha=0.2)
+
+    fig.tight_layout()
+    _save_figure(fig, out_path, "display alignment")
+
+    return {
+        "n_valid_trials": float(np.sum(valid)),
+        "n_missing_trials": float(np.sum(~valid)),
+        "median_ms": median_latency,
+        "mean_ms": mean_latency,
+        "min_ms": float(np.nanmin(valid_latency)) if len(valid_latency) else float("nan"),
+        "max_ms": float(np.nanmax(valid_latency)) if len(valid_latency) else float("nan"),
+        "per_rec": rec_summary,
     }
 
-    with open(out_dir / f"{args.day}_summary_metrics.json", "w", encoding="utf-8") as fh:
+
+def _resolve_day_paths(args: argparse.Namespace) -> Tuple[Path, str]:
+    if args.day_dir is not None:
+        day_dir = Path(args.day_dir).resolve()
+        return day_dir.parent, day_dir.name
+
+    if args.repo_root is None or args.day is None:
+        raise ValueError("Provide either --day-dir or both --repo-root and --day.")
+
+    return Path(args.repo_root).resolve(), str(args.day)
+
+
+def _default_out_dir(repo_root: Path, day: str) -> Path:
+    return repo_root / "claude" / "figures" / day / "beh"
+
+
+def _filter_trial_rows(data: Dict[str, np.ndarray], keep: np.ndarray) -> Dict[str, np.ndarray]:
+    filtered: Dict[str, np.ndarray] = {}
+    n_rows = len(keep)
+    for key, value in data.items():
+        arr = np.asarray(value)
+        if arr.ndim == 0:
+            filtered[key] = arr
+        elif arr.shape[0] == n_rows:
+            filtered[key] = arr[keep]
+        else:
+            filtered[key] = arr
+    return filtered
+
+
+def generate_day_presentation_plots(
+    repo_root: str | Path,
+    day: str,
+    out_dir: str | Path | None = None,
+    exclude_recs: Optional[List[int]] = None,
+    task_types: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    repo_root_path = Path(repo_root).resolve()
+    out_dir_path = Path(out_dir).resolve() if out_dir is not None else _default_out_dir(repo_root_path, day)
+    out_dir_path.mkdir(parents=True, exist_ok=True)
+    exclude_recs = exclude_recs or []
+    task_types = task_types or []
+
+    print(f"Using output directory: {out_dir_path}")
+    if exclude_recs:
+        print("Excluding recordings:", ", ".join(f"rec{rec:03d}" for rec in sorted(exclude_recs)))
+    else:
+        print("Excluding recordings: none")
+    if task_types:
+        print("Filtering task types:", ", ".join(sorted(task_types)))
+    else:
+        print("Filtering task types: none")
+
+    data = _load_all_trials(repo_root_path, day)
+    if exclude_recs:
+        rec = _flat(data, "Rec", int)
+        keep = ~np.isin(rec, np.asarray(exclude_recs, dtype=int))
+        data = _filter_trial_rows(data, keep)
+
+    if task_types:
+        requested = {str(task_type).strip().lower() for task_type in task_types if str(task_type).strip()}
+        task_type_values = _flat(data, "PyTaskType", object)
+        keep = np.array([str(task).strip().lower() in requested for task in task_type_values], dtype=bool)
+        print(f"Trials kept after task filter: {int(np.sum(keep))} / {len(keep)}")
+        data = _filter_trial_rows(data, keep)
+
+    metrics = {
+        "session_overview": plot_session_overview(
+            data, out_dir_path / f"{day}_overview_by_rec.png", day, exclude_recs
+        ),
+        "performance_over_time": plot_performance_over_time(
+            data, out_dir_path / f"{day}_performance_over_time.png", exclude_recs
+        ),
+        "display_alignment": plot_display_alignment(
+            data, out_dir_path / f"{day}_display_alignment.png", exclude_recs
+        ),
+        "target_performance": plot_target_performance(
+            data, out_dir_path / f"{day}_target_performance.png", exclude_recs
+        ),
+        "success_failure_timing": plot_success_failure_timing(
+            data, out_dir_path / f"{day}_success_failure_timing.png", exclude_recs
+        ),
+    }
+
+    metrics_path = out_dir_path / f"{day}_summary_metrics.json"
+    with open(metrics_path, "w", encoding="utf-8") as fh:
         json.dump(metrics, fh, indent=2)
+    print(f"Saved summary metrics: {metrics_path}")
+
+    return {
+        "metrics": metrics,
+        "metrics_path": str(metrics_path),
+        "out_dir": str(out_dir_path),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Generate presentation-style summary plots from AllTrials.mat")
+    parser.add_argument("--repo-root")
+    parser.add_argument("--day")
+    parser.add_argument("--day-dir")
+    parser.add_argument("--out-dir")
+    parser.add_argument("--exclude-recs", nargs="*", type=int, default=[])
+    parser.add_argument("--task-types", nargs="*", default=None)
+    args = parser.parse_args()
+
+    repo_root, day = _resolve_day_paths(args)
+    generate_day_presentation_plots(
+        repo_root=repo_root,
+        day=day,
+        out_dir=args.out_dir,
+        exclude_recs=args.exclude_recs,
+        task_types=args.task_types,
+    )
 
 
 if __name__ == "__main__":

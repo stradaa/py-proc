@@ -91,7 +91,7 @@ def load_joystick_dataset(repo_root: str | Path, day: str, rec: str = "001") -> 
     rec_dir = root / day / rec
     bag_mat = rec_dir / f"rec{rec}.bag" / "mat"
 
-    all_trials = loadmat(root / day / "mat" / "AllTrials.mat", simplify_cells=True)["AllTrials"]
+    all_trials_raw = loadmat(root / day / "mat" / "AllTrials.mat", simplify_cells=True)["AllTrials"]
     w = np.asarray(loadmat(rec_dir / f"rec{rec}.w_alignment.mat", simplify_cells=True)["w_drift_ros"], dtype=float).ravel()
     joystick = loadmat(bag_mat / "joystick.mat", simplify_cells=True)
     joystick_task_s = (
@@ -105,6 +105,7 @@ def load_joystick_dataset(repo_root: str | Path, day: str, rec: str = "001") -> 
     ev = loadmat(rec_dir / f"rec{rec}.ev.mat", simplify_cells=True)
     behav_results = [_parse_jsonish(v) for v in _as_list(ev["behav_results"])]
     task_configs = [_parse_jsonish(v) for v in _as_list(ev["trial_config"])]
+    all_trials = _filter_all_trials_for_rec(all_trials_raw, int(rec))
 
     ref_cfg = task_configs[0]
     cursor_x, cursor_y = reconstruct_cursor(joystick_x, joystick_y, joystick_task_s, ref_cfg)
@@ -125,6 +126,21 @@ def load_joystick_dataset(repo_root: str | Path, day: str, rec: str = "001") -> 
         behav_results=behav_results,
         task_configs=task_configs,
     )
+
+
+def _filter_all_trials_for_rec(all_trials: Dict[str, Any], rec: int) -> Dict[str, Any]:
+    rec_values = np.asarray(all_trials["Rec"], dtype=float).ravel()
+    keep = rec_values == float(rec)
+    filtered: Dict[str, Any] = {}
+    for key, value in all_trials.items():
+        arr = np.asarray(value)
+        if arr.ndim == 0:
+            filtered[key] = arr
+        elif arr.shape[0] == len(rec_values):
+            filtered[key] = arr[keep]
+        else:
+            filtered[key] = value
+    return filtered
 
 
 def reconstruct_cursor(
@@ -231,6 +247,7 @@ def extract_trial_event_times_task_s(dataset: JoystickDataset, alltrial: Dict[st
     start_on_rec_ms = float(alltrial["StartOn"])
     events: Dict[str, float] = {"StartOn": dataset.rec_ms_to_task_s(start_on_rec_ms)}
     for key in (
+        "disStartOn",
         "End",
         "JoystickTargetOn",
         "JoystickFirstMovement",
@@ -248,6 +265,51 @@ def extract_trial_event_times_task_s(dataset: JoystickDataset, alltrial: Dict[st
         value = float(alltrial.get(key, np.nan))
         events[key] = np.nan if np.isnan(value) else dataset.rec_ms_to_task_s(start_on_rec_ms + value)
     return events
+
+
+def _timeseries_reference_time(segment: TrialSegment) -> Tuple[float, str]:
+    dis_start_on = float(segment.events_task_s.get("disStartOn", np.nan))
+    if np.isfinite(dis_start_on):
+        return dis_start_on, "disStartOn"
+
+    target_on_event = select_attempt_event(segment.attempt, "target_on", "first")
+    if target_on_event is not None:
+        return float(target_on_event["time_perf_counter"]), "target_on"
+
+    return float(segment.task_time_s[0]), "trial_start"
+
+
+def _assign_event_label_lanes(event_times: Sequence[float], min_spacing_s: float = 0.09, max_lanes: int = 4) -> List[int]:
+    lane_last_x = np.full(max_lanes, -np.inf, dtype=float)
+    lanes: List[int] = []
+    for x in event_times:
+        lane = 0
+        while lane < max_lanes and x - lane_last_x[lane] < min_spacing_s:
+            lane += 1
+        lane = min(lane, max_lanes - 1)
+        lane_last_x[lane] = x
+        lanes.append(int(lane))
+    return lanes
+
+
+def _preferred_event_label_lane(event_name: str) -> Optional[int]:
+    bottom_names = {"target_on", "target_entry", "hold_complete"}
+    top_names = {"first_joystick_movement", "hold_start", "success", "fail"}
+    if event_name in bottom_names:
+        return 0
+    if event_name in top_names:
+        return 1
+    return None
+
+
+def _preferred_event_label_x_offset(event_name: str) -> float:
+    left_names = {"target_on", "target_entry", "hold_complete"}
+    right_names = {"first_joystick_movement", "hold_start", "success", "fail"}
+    if event_name in left_names:
+        return -0.018
+    if event_name in right_names:
+        return 0.018
+    return 0.0
 
 
 def validate_trial_alignment(dataset: JoystickDataset, trial_index: int) -> List[Dict[str, Any]]:
@@ -406,11 +468,11 @@ def plot_trial_trajectory(segment: TrialSegment, out_path: str | Path) -> None:
 
 
 def plot_trial_timeseries(segment: TrialSegment, out_path: str | Path) -> None:
-    target_on_event = select_attempt_event(segment.attempt, "target_on", "first")
-    target_on_time = float(target_on_event["time_perf_counter"]) if target_on_event is not None else segment.task_time_s[0]
-    t_rel = segment.task_time_s - target_on_time
+    reference_time, reference_label = _timeseries_reference_time(segment)
+    t_rel = segment.task_time_s - reference_time
+    dis_start_on_time = float(segment.events_task_s.get("disStartOn", np.nan))
 
-    fig, axes = plt.subplots(2, 1, figsize=(13, 6), sharex=True)
+    fig, axes = plt.subplots(2, 1, figsize=(13, 6.2), sharex=True)
     axes[0].plot(t_rel, segment.joystick_x, label="joystick_x", color="#1f77b4")
     axes[0].plot(t_rel, segment.joystick_y, label="joystick_y", color="#ff7f0e")
     axes[0].legend(loc="best")
@@ -423,17 +485,41 @@ def plot_trial_timeseries(segment: TrialSegment, out_path: str | Path) -> None:
     axes[1].axhline(segment.target_y, color="#d62728", linestyle="--", alpha=0.5, label="target_y")
     axes[1].legend(loc="best")
     axes[1].set_ylabel("cursor")
-    axes[1].set_xlabel("time from target_on (task seconds)")
+    axes[1].set_xlabel(f"time from {reference_label} (task seconds)")
     axes[1].grid(True, alpha=0.2)
 
+    if np.isfinite(dis_start_on_time):
+        dis_start_on_x = dis_start_on_time - reference_time
+        for ax in axes:
+            ax.axvline(dis_start_on_x, color="#111111", alpha=0.9, linestyle=":", linewidth=1.6, zorder=3)
+        axes[0].text(
+            dis_start_on_x,
+            0.06,
+            "disStartOn",
+            rotation=90,
+            color="#111111",
+            fontsize=8,
+            ha="center",
+            va="bottom",
+            transform=blended_transform_factory(axes[0].transData, axes[0].transAxes),
+            bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none", "pad": 0.5},
+        )
+
     text_transform = blended_transform_factory(axes[0].transData, axes[0].transAxes)
-    for i, labeled_event in enumerate(iter_labeled_attempt_events(segment.attempt)):
-        x = float(labeled_event["time_perf_counter"]) - target_on_time
+    labeled_events = iter_labeled_attempt_events(segment.attempt)
+    event_x = [float(labeled_event["time_perf_counter"]) - reference_time for labeled_event in labeled_events]
+    lanes = _assign_event_label_lanes(event_x)
+    lane_y = [0.72, 0.96, 0.56, 0.84]
+    for labeled_event, x, lane in zip(labeled_events, event_x, lanes):
+        preferred_lane = _preferred_event_label_lane(labeled_event["name"])
+        if preferred_lane is not None:
+            lane = preferred_lane
+        x_text = x + _preferred_event_label_x_offset(labeled_event["name"])
         for ax in axes:
             ax.axvline(x, color=labeled_event["color"], alpha=0.7, linestyle="--", linewidth=1.2)
         axes[0].text(
-            x,
-            1.02 + 0.06 * (i % 2),
+            x_text,
+            lane_y[lane],
             labeled_event["label"],
             rotation=90,
             color=labeled_event["color"],
@@ -441,10 +527,10 @@ def plot_trial_timeseries(segment: TrialSegment, out_path: str | Path) -> None:
             ha="center",
             va="bottom",
             transform=text_transform,
+            bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none", "pad": 0.6},
         )
 
-    fig.suptitle(f"Trial {segment.trial_index + 1}: joystick and cursor traces")
-    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.tight_layout()
     fig.savefig(out_path, dpi=160)
     plt.close(fig)
 
