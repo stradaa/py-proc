@@ -26,6 +26,8 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QTabWidget,
+    QTextBrowser,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -40,6 +42,7 @@ from pyCheck.joystick_validation import (
     plot_trial_timeseries,
     plot_trial_trajectory,
 )
+from run_day_pipeline import run_day_pipeline
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp"}
@@ -135,6 +138,12 @@ class ProcGuiWindow(QMainWindow):
         controls_panel = QWidget()
         controls_layout = QVBoxLayout(controls_panel)
 
+        left_splitter = QSplitter(Qt.Orientation.Vertical)
+        controls_layout.addWidget(left_splitter)
+
+        inputs_container = QWidget()
+        inputs_layout = QVBoxLayout(inputs_container)
+
         io_group = QGroupBox("Inputs")
         io_form = QFormLayout(io_group)
 
@@ -155,27 +164,129 @@ class ProcGuiWindow(QMainWindow):
         out_row.addWidget(browse_out_btn)
         io_form.addRow("Out Dir", self._wrap_layout(out_row))
 
-        self.rec_combo = QComboBox()
-        self.rec_combo.setEditable(True)
-        self.rec_combo.currentTextChanged.connect(self._schedule_auto_trial_plot)
-        io_form.addRow("Rec", self.rec_combo)
+        inputs_layout.addWidget(io_group)
+        inputs_layout.addStretch(1)
 
-        self.task_types_edit = QLineEdit()
-        self.task_types_edit.setPlaceholderText("joystick_intro, other_task")
-        io_form.addRow("Task Types", self.task_types_edit)
+        notes_group = QGroupBox("Day Notes")
+        notes_layout = QVBoxLayout(notes_group)
+        self.notes_path_label = QLabel("No day notes detected")
+        self.notes_path_label.setWordWrap(True)
+        notes_layout.addWidget(self.notes_path_label)
+        self.notes_view = QTextBrowser()
+        self.notes_view.setOpenExternalLinks(True)
+        self.notes_view.setPlaceholderText("Selecting a day directory will load the day notes markdown file here.")
+        notes_layout.addWidget(self.notes_view)
 
-        self.exclude_recs_edit = QLineEdit()
-        self.exclude_recs_edit.setPlaceholderText("3,5")
-        io_form.addRow("Exclude Recs", self.exclude_recs_edit)
+        actions_container = QWidget()
+        actions_layout = QVBoxLayout(actions_container)
 
-        self.sample_trials_edit = QLineEdit()
-        self.sample_trials_edit.setPlaceholderText("1 2 4 or 90-130")
-        io_form.addRow("Sample Trials", self.sample_trials_edit)
+        tabs = QTabWidget()
+        actions_layout.addWidget(tabs)
 
-        controls_layout.addWidget(io_group)
+        processing_tab = QWidget()
+        processing_layout = QVBoxLayout(processing_tab)
+
+        processing_group = QGroupBox("run_day_pipeline")
+        processing_form = QFormLayout(processing_group)
+
+        self.pipeline_rec_edit = QLineEdit()
+        self.pipeline_rec_edit.setPlaceholderText("blank = all recs, or 005")
+        processing_form.addRow("Pipeline Rec", self.pipeline_rec_edit)
+
+        self.skip_video_checkbox = QCheckBox("Skip video extraction")
+        processing_form.addRow("", self.skip_video_checkbox)
+
+        self.skip_existing_video_checkbox = QCheckBox("Skip existing video outputs")
+        processing_form.addRow("", self.skip_existing_video_checkbox)
+
+        self.no_display_checkbox = QCheckBox("No display pass only")
+        processing_form.addRow("", self.no_display_checkbox)
+
+        processing_layout.addWidget(processing_group)
+
+        processing_button_group = QGroupBox("Processing Actions")
+        processing_button_layout = QVBoxLayout(processing_button_group)
+        run_pipeline_btn = QPushButton("Run Day Pipeline")
+        run_pipeline_btn.clicked.connect(self.run_processing_pipeline)
+        processing_button_layout.addWidget(run_pipeline_btn)
+        processing_layout.addWidget(processing_button_group)
+        processing_layout.addStretch(1)
+
+        tabs.addTab(processing_tab, "Processing")
+
+        inspection_tab = QWidget()
+        inspection_layout = QVBoxLayout(inspection_tab)
+
+        summary_group = QGroupBox("Day Summary")
+        summary_form = QFormLayout(summary_group)
+
+        self.summary_task_types_edit = QLineEdit()
+        self.summary_task_types_edit.setPlaceholderText("joystick_intro, other_task")
+        summary_form.addRow("Task Types", self.summary_task_types_edit)
+
+        self.summary_exclude_recs_edit = QLineEdit()
+        self.summary_exclude_recs_edit.setPlaceholderText("3,5")
+        summary_form.addRow("Exclude Recs", self.summary_exclude_recs_edit)
+
+        summary_btn = QPushButton("Generate Day Summary")
+        summary_btn.clicked.connect(self.generate_day_summary)
+        summary_form.addRow("", summary_btn)
+        self._set_help_text(
+            summary_btn,
+            (
+                "Generate the full day-level summary figure set.\n\n"
+                "Uses: Task Types, Exclude Recs, Day Dir, and Out Dir.\n\n"
+                "Outputs:\n"
+                f"- <day>_overview_by_rec.png: trial count and success rate for each recording.\n"
+                f"- <day>_performance_over_time.png: rolling success and trial duration across the session.\n"
+                f"- <day>_display_alignment.png: disStartOn latency distribution and per-recording alignment.\n"
+                f"- <day>_target_performance.png: spatial target success map and target usage density.\n"
+                f"- <day>_success_failure_timing.png: timing distributions for success vs failure.\n"
+                f"- <day>_summary_metrics.json: summary values behind the plots.\n\n"
+                "Use this when you want a high-level view of session quality, performance drift, target-specific "
+                "behavior, and display timing."
+            ),
+        )
+        inspection_layout.addWidget(summary_group)
+
+        validation_group = QGroupBox("Validation Report")
+        validation_form = QFormLayout(validation_group)
+
+        self.validation_rec_combo = QComboBox()
+        self.validation_rec_combo.setEditable(True)
+        validation_form.addRow("Rec", self.validation_rec_combo)
+
+        self.validation_sample_trials_edit = QLineEdit()
+        self.validation_sample_trials_edit.setPlaceholderText("1 2 4 or 90-130")
+        validation_form.addRow("Sample Trials", self.validation_sample_trials_edit)
+
+        validation_btn = QPushButton("Generate Validation Report")
+        validation_btn.clicked.connect(self.generate_validation_report)
+        validation_form.addRow("", validation_btn)
+        self._set_help_text(
+            validation_btn,
+            (
+                "Generate joystick validation figures for the selected recording.\n\n"
+                "Uses: Rec, Sample Trials, Day Dir, and Out Dir.\n\n"
+                "Outputs:\n"
+                "- alignment_summary.png: distributions of event timing error and cursor reconstruction error.\n"
+                "- cursor_shift_sweep.png: how a constant timestamp shift changes cursor error; useful for "
+                "spotting systematic timing offsets.\n"
+                "- trial_<n>_trajectory.png and trial_<n>_timeseries.png for sample trials.\n"
+                "- validation_summary.json: numeric summary including the best constant shift estimate.\n\n"
+                "Use this to check whether behavioral events, joystick timestamps, and reconstructed cursor "
+                "trajectories are internally consistent."
+            ),
+        )
+        inspection_layout.addWidget(validation_group)
 
         trial_group = QGroupBox("Trial Plot")
         trial_form = QFormLayout(trial_group)
+
+        self.trial_rec_combo = QComboBox()
+        self.trial_rec_combo.setEditable(True)
+        self.trial_rec_combo.currentTextChanged.connect(self._schedule_auto_trial_plot)
+        trial_form.addRow("Rec", self.trial_rec_combo)
 
         self.trial_spin = QSpinBox()
         self.trial_spin.setRange(1, 10000)
@@ -206,55 +317,14 @@ class ProcGuiWindow(QMainWindow):
             "Automatically regenerate the selected-trial figure when the recording, trial, or plot type changes.",
         )
 
-        controls_layout.addWidget(trial_group)
-
-        button_group = QGroupBox("Actions")
-        button_layout = QVBoxLayout(button_group)
-
-        summary_btn = QPushButton("Generate Day Summary")
-        summary_btn.clicked.connect(self.generate_day_summary)
-        button_layout.addWidget(summary_btn)
-        self._set_help_text(
-            summary_btn,
-            (
-                "Generate the full day-level summary figure set.\n\n"
-                "Outputs:\n"
-                f"- <day>_overview_by_rec.png: trial count and success rate for each recording.\n"
-                f"- <day>_performance_over_time.png: rolling success and trial duration across the session.\n"
-                f"- <day>_display_alignment.png: disStartOn latency distribution and per-recording alignment.\n"
-                f"- <day>_target_performance.png: spatial target success map and target usage density.\n"
-                f"- <day>_success_failure_timing.png: timing distributions for success vs failure.\n"
-                f"- <day>_summary_metrics.json: summary values behind the plots.\n\n"
-                "Use this when you want a high-level view of session quality, performance drift, target-specific "
-                "behavior, and display timing."
-            ),
-        )
-
-        validation_btn = QPushButton("Generate Validation Report")
-        validation_btn.clicked.connect(self.generate_validation_report)
-        button_layout.addWidget(validation_btn)
-        self._set_help_text(
-            validation_btn,
-            (
-                "Generate joystick validation figures for the selected recording.\n\n"
-                "Outputs:\n"
-                "- alignment_summary.png: distributions of event timing error and cursor reconstruction error.\n"
-                "- cursor_shift_sweep.png: how a constant timestamp shift changes cursor error; useful for "
-                "spotting systematic timing offsets.\n"
-                "- trial_<n>_trajectory.png and trial_<n>_timeseries.png for sample trials.\n"
-                "- validation_summary.json: numeric summary including the best constant shift estimate.\n\n"
-                "Use this to check whether behavioral events, joystick timestamps, and reconstructed cursor "
-                "trajectories are internally consistent."
-            ),
-        )
-
         trial_btn = QPushButton("Generate Selected Trial Plot")
         trial_btn.clicked.connect(self.generate_selected_trial_plot)
-        button_layout.addWidget(trial_btn)
+        trial_form.addRow("", trial_btn)
         self._set_help_text(
             trial_btn,
             (
                 "Generate one figure for the selected trial and plot type.\n\n"
+                "Uses: Rec, Trial, Plot, Day Dir, and Out Dir.\n\n"
                 "If Plot = timeseries, the output is trial_<n>_timeseries.png showing joystick and reconstructed "
                 "cursor signals over time with event markers.\n"
                 "If Plot = trajectory, the output is trial_<n>_trajectory.png showing the cursor path in task "
@@ -263,22 +333,38 @@ class ProcGuiWindow(QMainWindow):
             ),
         )
 
+        inspection_layout.addWidget(trial_group)
+
         refresh_btn = QPushButton("Refresh Output Browser")
         refresh_btn.clicked.connect(self.refresh_output_browser)
-        button_layout.addWidget(refresh_btn)
         self._set_help_text(
             refresh_btn,
             "Reload the image list from the current output directory and update the preview pane.",
         )
+        inspection_layout.addWidget(refresh_btn)
+        inspection_layout.addStretch(1)
 
-        controls_layout.addWidget(button_group)
+        tabs.addTab(inspection_tab, "Inspection")
 
         self.status_label = QLabel("Ready")
-        controls_layout.addWidget(self.status_label)
+        actions_layout.addWidget(self.status_label)
+        actions_layout.addStretch(1)
 
+        log_group = QGroupBox("Output Log")
+        log_layout = QVBoxLayout(log_group)
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
-        controls_layout.addWidget(self.log_view, stretch=1)
+        log_layout.addWidget(self.log_view)
+
+        left_splitter.addWidget(inputs_container)
+        left_splitter.addWidget(notes_group)
+        left_splitter.addWidget(actions_container)
+        left_splitter.addWidget(log_group)
+        left_splitter.setStretchFactor(0, 2)
+        left_splitter.setStretchFactor(1, 4)
+        left_splitter.setStretchFactor(2, 5)
+        left_splitter.setStretchFactor(3, 3)
+        left_splitter.setSizes([130, 240, 420, 180])
 
         splitter.addWidget(controls_panel)
 
@@ -336,22 +422,48 @@ class ProcGuiWindow(QMainWindow):
             self.output_dir_path = expected_out_dir
             self.last_auto_out_dir = expected_out_dir
             self.refresh_output_browser()
+        self._load_day_notes(day_dir)
         self._populate_rec_choices(day_dir)
         self.status_label.setText(f"Loaded day {day_dir.name}")
 
+    def _find_day_notes_file(self, day_dir: Path) -> Optional[Path]:
+        exact = sorted(day_dir.glob(f"{day_dir.name}_*.md"))
+        if exact:
+            return exact[0]
+        any_md = sorted(day_dir.glob("*.md"))
+        return any_md[0] if any_md else None
+
+    def _load_day_notes(self, day_dir: Path) -> None:
+        notes_path = self._find_day_notes_file(day_dir)
+        if notes_path is None:
+            self.notes_path_label.setText("No day notes detected")
+            self.notes_view.setMarkdown("")
+            return
+        self.notes_path_label.setText(f"Notes file: {notes_path.name}")
+        try:
+            text = notes_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = notes_path.read_text(errors="replace")
+        self.notes_view.setMarkdown(text)
+
     def _populate_rec_choices(self, day_dir: Path) -> None:
-        current = self.rec_combo.currentText().strip()
+        validation_current = self.validation_rec_combo.currentText().strip()
+        trial_current = self.trial_rec_combo.currentText().strip()
         recs = sorted(p.name for p in day_dir.iterdir() if p.is_dir() and p.name.isdigit())
-        self.rec_combo.blockSignals(True)
-        self.rec_combo.clear()
-        self.rec_combo.addItems(recs)
-        if current and current in recs:
-            self.rec_combo.setCurrentText(current)
-        elif recs:
-            self.rec_combo.setCurrentIndex(0)
-        else:
-            self.rec_combo.setEditText("001")
-        self.rec_combo.blockSignals(False)
+        for combo, current in (
+            (self.validation_rec_combo, validation_current),
+            (self.trial_rec_combo, trial_current),
+        ):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(recs)
+            if current and current in recs:
+                combo.setCurrentText(current)
+            elif recs:
+                combo.setCurrentIndex(0)
+            else:
+                combo.setEditText("001")
+            combo.blockSignals(False)
 
     def _day_dir_path(self) -> Optional[Path]:
         text = self.day_dir_edit.text().strip()
@@ -372,7 +484,13 @@ class ProcGuiWindow(QMainWindow):
         return day_dir.parent, day_dir.name
 
     def _selected_rec(self) -> str:
-        rec = self.rec_combo.currentText().strip()
+        rec = self.validation_rec_combo.currentText().strip()
+        if not rec:
+            raise ValueError("Choose a recording.")
+        return rec
+
+    def _selected_trial_rec(self) -> str:
+        rec = self.trial_rec_combo.currentText().strip()
         if not rec:
             raise ValueError("Choose a recording.")
         return rec
@@ -444,8 +562,8 @@ class ProcGuiWindow(QMainWindow):
     def generate_day_summary(self) -> None:
         repo_root, day = self._repo_root_and_day()
         out_dir = self._out_dir_path()
-        exclude_recs = self._parse_int_csv(self.exclude_recs_edit.text())
-        task_types = self._parse_str_csv(self.task_types_edit.text())
+        exclude_recs = self._parse_int_csv(self.summary_exclude_recs_edit.text())
+        task_types = self._parse_str_csv(self.summary_task_types_edit.text())
 
         def _done(result: Any) -> None:
             if isinstance(result, dict):
@@ -463,11 +581,34 @@ class ProcGuiWindow(QMainWindow):
             on_done=_done,
         )
 
+    def run_processing_pipeline(self) -> None:
+        day_dir = self._day_dir_path()
+        if day_dir is None:
+            QMessageBox.warning(self, "proc_gui", "Choose a day directory first.")
+            return
+        rec_text = self.pipeline_rec_edit.text().strip() or None
+
+        def _done(result: Any) -> None:
+            self._sync_day_dir_fields()
+            if isinstance(result, dict):
+                self._append_log(json_like(result))
+
+        self._run_worker(
+            "Running day pipeline...",
+            run_day_pipeline,
+            day_dir,
+            self.skip_video_checkbox.isChecked(),
+            self.skip_existing_video_checkbox.isChecked(),
+            self.no_display_checkbox.isChecked(),
+            rec_text,
+            on_done=_done,
+        )
+
     def generate_validation_report(self) -> None:
         repo_root, day = self._repo_root_and_day()
         out_dir = self._out_dir_path()
         rec = self._selected_rec()
-        sample_text = self.sample_trials_edit.text().strip()
+        sample_text = self.validation_sample_trials_edit.text().strip()
         sample_trials = parse_trial_tokens(sample_text.split()) if sample_text else None
 
         def _done(result: Any) -> None:
@@ -490,7 +631,7 @@ class ProcGuiWindow(QMainWindow):
         try:
             repo_root, day = self._repo_root_and_day()
             out_dir = self._out_dir_path()
-            rec = self._selected_rec()
+            rec = self._selected_trial_rec()
         except Exception as exc:
             QMessageBox.warning(self, "proc_gui", str(exc))
             return

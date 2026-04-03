@@ -4,6 +4,7 @@ Optional PyQt6 desktop GUI for the `pyCheck` workflows.
 
 What it supports:
 - choose a day directory and recording
+- run the full `run_day_pipeline.py` workflow from a Processing tab
 - generate day presentation plots
 - generate joystick validation summary plots
 - generate a selected trial trajectory or timeseries plot
