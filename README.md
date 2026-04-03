@@ -54,6 +54,25 @@ Current AlexRig extension: `procThalamus_indie.py` also writes `bag/mat/joystick
 
 ---
 
+## GUI
+
+An optional PyQt6 GUI now exists under `proc_gui/` for both processing and inspection.
+
+Launch:
+
+```bash
+./.venv/bin/python proc_gui/run_gui.py
+```
+
+What it currently supports:
+- select a day directory and auto-detect the matching output folder
+- view the day notes markdown file (`<DAY>_<MONKEY>.md`) directly in the app
+- run `run_day_pipeline.py` from a Processing tab
+- generate `pyCheck` validation plots and day summary plots from an Inspection tab
+- browse generated figures in the output folder
+
+---
+
 ## Key Technical Decisions
 
 ### Clock alignment (AlexRig single-clock shortcut)
@@ -245,144 +264,41 @@ raw eye data can corrupt the mean, shifting the entire filtered trace by million
 
 **Effect**: 260302 rec002 saccade detection restored. No change on other days.
 
+### `pre_proc.py` — sparse trial recovery fallback (2026-04-02)
+
+**Root cause**: Some sparse / irregular AlexRig `BehavState` streams (notably day `260402`) did
+not satisfy the original strict intertrial-window assumptions, so valid trials could collapse to
+zero during reconstruction.
+
+**Fix**: Added a fallback path that directly recovers `START_* -> SUCCESS/FAIL` trial spans and
+matches `trial_summary` timestamps with a small boundary tolerance.
+
+**Effect**: Day `260402` trial recovery works again without changing ordinary days that already
+fit the original logic.
+
 ---
 
 ## Joystick Support (Current State)
 
-### What is already done
-
-- The joystick task now emits only sparse canonical `BehavState` values for trial structure: `intertrial`, `start_on`, `success`, `fail`.
-- Rich within-trial joystick task events remain in `behav_result['attempts'][...]['events']`, including `target_on`, `first_joystick_movement`, `target_entry`, `target_exit`, `hold_start`, `hold_break`, `hold_complete`, `reward_triggered`, `bonus_reward_triggered`, `ignored_idle_timeout`, `free_play_start`, and `free_play_end_requested`.
-- The photodiode / display square is toggled only on `start_on`, so display matching should be used only to refine the true visual target-onset time.
-- `procThalamus_indie.py` now extracts the recorded `Joystick` analog node into `bag/mat/joystick.mat` as timestamped `x`/`y` samples, preserving every sample instead of collapsing by timestamp.
-- `proc_events.py` now writes joystick-related fields into `Events.mat` / `AllTrials.mat` / `Trials.mat`:
+- The joystick task now uses sparse canonical `BehavState` values for trial structure and keeps rich
+  within-trial events in `behav_result['attempts'][...]['events']`.
+- `procThalamus_indie.py` extracts the recorded analog joystick stream to `bag/mat/joystick.mat`
+  with preserved timestamps and sample-by-sample `x` / `y`.
+- `proc_events.py` writes joystick timing fields into `Events.mat`, `AllTrials.mat`, and `Trials.mat`:
   `JoystickTargetOn`, `JoystickFirstMovement`, `JoystickTargetEntry`,
   `JoystickTargetEntryFinal`, `JoystickTargetExit`, `JoystickTargetExitFinal`,
   `JoystickHoldStart`, `JoystickHoldStartFinal`, `JoystickHoldBreak`,
   `JoystickHoldBreakFinal`, `JoystickHoldComplete`, `JoystickReward`,
   and `JoystickAttemptCount`.
-- A separate validation / visualization folder now exists at `pyCheck/`.
-  It reconstructs cursor position from `joystick.mat` using the real task logic in
-  `thalamus/task_controller/joystick_intro.py`, loads `AllTrials.mat`, and generates
-  timeseries / trajectory plots for inspection.
-
-### Current joystick contract
-
-- Primary continuous joystick source: recorded `Joystick` node from the behave bag.
-- Fallback / debugging source: task-side `behav_result['joystick_samples']` if needed, but this is not the preferred analysis source.
-- Saved intermediate file: `bag/mat/joystick.mat` with `header_stamp_sec`, `header_stamp_nanosec`, `x`, `y`.
-- These timestamps are still in task / ROS-side time and should be aligned later using `w_drift_ros`, just like other task-side modalities.
-
-### Validation status on day `260324`
-
-- `260324` has now been processed both with and without video.
-- Video-enabled extraction completes successfully. On Windows systems without symlink privilege,
-  `procThalamus_indie.py` now falls back from symlink to normal file copy for the camera MP4s.
-- `joystick.mat` for `260324` contains `26030` samples, with monotonic timestamps and plausible
-  X/Y range.
-- `pyCheck` currently produces:
-  - joystick / cursor timeseries plots
-  - reconstructed cursor trajectory plots
-  - an alignment summary histogram
-  - a constant-shift sweep figure for debugging timestamp offsets
-- The **current plotting code is good enough for qualitative inspection**.
-  The timeseries and trajectory plots now use raw task attempt events from `behav_result`
-  as the primary annotation source, so repeated events such as `target_entry`, `target_exit`,
-  `target_entry_2`, `target_exit_2`, `target_entry_3`, etc. are visible at the correct
-  within-trial spacing.
-- `proc_events.py` joystick event promotion has now been fixed:
-  processed `Joystick*` fields are generated from absolute task timestamps in
-  `behav_result['final_attempt']['events'][...]['time_perf_counter']`, aligned into recorder time
-  through `w_drift_ros`, instead of being reconstructed backwards from `End`.
-- On the explicit failure case `260324`, trial 4, all processed `Joystick*` fields now round-trip
-  back to the raw `behav_result` event times with `0.0 ms` error in `pyCheck`.
-- The remaining joystick timing concern is now **not** the processed `Joystick*` fields.
-  It is the relation between task `StartOn` and photodiode-confirmed `disStartOn`.
-
-### Current photodiode / target-onset status
-
-- `StartOn` and `disStartOn` are now intentionally kept separate.
-  `StartOn` remains the original task-controller timestamp from the `BehavState=start_on` event.
-  `disStartOn` stores the photodiode/display-matched timestamp from `proc_display.py`.
-- This is intentional: downstream analysis can choose whether to use task-side onset or
-  display-confirmed onset.
-
-#### Current unresolved concern: `disStartOn` appears far too late
-
-For `260324`, rec `001`, the currently matched display onset is much later than the task-side
-`StartOn`. Example first five trials:
-
-- trial 1: `disStartOn - StartOn = 941 ms`
-- trial 2: `1227 ms`
-- trial 3: `1519 ms`
-- trial 4: `1428 ms`
-- trial 5: `1680 ms`
-
-Across all 30 trials on this rec:
-
-- median `disStartOn - StartOn`: `1219 ms`
-- mean: `1206 ms`
-- range: `641–1680 ms`
-
-This is implausibly large if the photodiode square really turns on in the same rendered frame as
-the target. A normal monitor / photodiode lag should be on the order of tens of milliseconds, not
-~1 second.
-
-#### What has been ruled out so far
-
-- The joystick `Joystick*` fields are no longer the source of the problem; they match raw
-  `behav_result` timing correctly.
-- The `disStartOn - StartOn` offset does **not** show a meaningful linear drift across trials.
-  A least-squares fit versus trial number gives approximately:
-  `slope = -1.67 ms / trial`, `R^2 = 0.0028`.
-- The offset also does **not** correlate meaningfully with absolute recording time or trial duration.
-- Around each task `StartOn`, the raw thresholded display trace currently shows only one detectable
-  transition within `±2 s`, and it is the late one currently being matched.
-
-**Interpretation**:
-
-- The present `disStartOn` values should **not** yet be trusted as the true visual onset.
-- The remaining problem is likely in photodiode/display detection or display-event matching,
-  not in joystick event promotion.
-
-### Recommended field policy
-
-- `StartOn`: original task-controller `start_on` event.
-- `disStartOn`: separate photodiode / display-confirmed onset from `proc_display.py`.
-- `Success` / `Fail`: task-controller timed.
-- `target_entry`, `hold_start`, `hold_complete`: initially task-emitted from `behav_result`.
-- Continuous joystick trajectory: derived from `joystick.mat` after clock alignment.
-
-### Resume checklist for a future session
-
-When resuming joystick work, inspect these in order:
-
-1. `proc/PyTaskCtrl/py_proc/procThalamus_indie.py`
-   Confirm `joystick.mat` is being written and sample counts look correct.
-   Also confirm the Windows video-link fallback still works (`copyfile` fallback when symlink fails).
-2. `proc/PyTaskCtrl/py_proc/pre_proc.py`
-   Confirm sparse joystick task `BehavState` values produce valid trials.
-3. `proc/PyTaskCtrl/py_proc/proc_events.py`
-   Confirm the fixed joystick event-promotion path is still intact:
-   `Joystick*` fields should be generated from absolute `time_perf_counter` values and aligned via
-   `w_drift_ros`, not reconstructed backwards from `End`.
-4. `pyCheck/joystick_validation.py`
-   Use this as the current ground-truth inspection tool.
-   The plots look okay now because they use raw `behav_result` attempt events for annotation.
-5. One real processed recording with video, currently `260324`
-   Compare:
-   - photodiode / `start_on`
-   - visible cursor movement in video
-   - raw `behav_result['final_attempt']['events']`
-   - processed `Joystick*` fields in `AllTrials.mat`
-6. Keep the `260324`, trial 4 example in mind
-   This is still the best concrete trial to compare across:
-   task `StartOn`, `disStartOn`, raw `behav_result` joystick events, `joystick.mat`, and video.
-7. Inspect the raw display signal around trial onset
-   Determine whether the matched edge is really the photodiode square turning on, or whether the
-   current threshold / matching logic is locking onto the wrong transition.
-8. Do **not** treat `disStartOn` as trustworthy visual onset until the large `~1.2 s` offset is explained
-   For now, retain both task `StartOn` and photodiode `disStartOn` and compare them explicitly.
+- The processed `Joystick*` fields are now promoted from absolute task-side event timestamps in
+  `behav_result['final_attempt']['events'][...]['time_perf_counter']` and aligned through
+  `w_drift_ros`; they are no longer reconstructed backwards from `End`.
+- `StartOn` remains the original task-controller `start_on` timestamp. `disStartOn` remains the
+  photodiode / display-confirmed onset from `proc_display.py` and is now usable for the joystick
+  days that have been revalidated.
+- `pyCheck/` is the current inspection layer. It reconstructs cursor position from `joystick.mat`,
+  validates processed event timing against `behav_result`, renders per-trial timeseries and
+  trajectory plots, summarizes display alignment, and generates day-level presentation plots.
 
 ---
 
@@ -394,104 +310,3 @@ When resuming joystick work, inspect these in order:
   genuinely ambiguous; they just pick differently.
 - **`MONKEYDIR` portability**: All pipeline functions take `monkeydir` as an explicit parameter.
   Only the runner script (`p260303_procLoop.py`) has it hardcoded.
-- **Photodiode / display onset mismatch on joystick day `260324`**:
-  `disStartOn` is now being populated for `joystick_intro`, but the matched photodiode onset is
-  implausibly late relative to task `StartOn` (median ~1219 ms, range 641–1680 ms on rec `001`).
-  This does not show a simple linear drift across trials, so the likely remaining issue is in
-  display signal interpretation or event matching rather than joystick event timing.
-
----
-
-## Patch Notes: Trial Recovery Fix for Day `260402`
-
-### Symptom
-
-- `check_processability.py` reported that the raw `behave.*` files for day `260402` were
-  processable.
-- But `run_day_pipeline.py` later produced `0 trials` for both `rec001` and `rec002`.
-- This looked contradictory at first, because both recordings clearly contained embedded
-  `BehavState` messages and task-summary JSON records.
-
-### What was actually happening
-
-- `check_processability.py` only answers a narrow question:
-  "Does the raw capture contain the minimum text streams needed for the pipeline?"
-- It marks a recording as processable if it finds:
-  - at least one `BehavState=...` text record
-  - at least one task-summary JSON record
-- That check does **not** guarantee that `pre_proc.py` can reconstruct complete trials.
-
-- The real failure happened later inside `pre_proc.py`.
-- The original trial matcher expected a fairly strict structure:
-  - trials were separated cleanly by `INTERTRIAL`
-  - each intertrial-delimited span contained exactly one start state
-  - each such span also contained exactly one end state (`SUCCESS` or `FAIL`)
-  - each `trial_summary` timestamp landed strictly inside one intertrial interval
-
-### Why day `260402` broke that logic
-
-#### `rec001`
-
-- The extracted state stream looked like:
-  `start_on -> success -> intertrial -> start_on -> success -> intertrial -> ...`
-- So the recording began with a real trial **before** the first `intertrial`.
-- The original code only built trial windows from one `intertrial` to the next.
-- That meant the first real trial had no valid leading intertrial window.
-- Also, the `trial_summary` timestamps for this day landed right at or very near the trailing
-  `intertrial`, so the strict `t_start < ts < t_end` test could fail even for valid trials.
-
-#### `rec002`
-
-- The extracted state stream included real started trials, but also extra sparse fragments like:
-  `FAIL -> INTERTRIAL -> pulse_end`
-- Those fragments created intertrial-delimited spans with unexpected numbers of starts or ends.
-- The original code rejected any span that did not have exactly one start and exactly one end.
-- As a result, valid trials were present in the data, but the strict interval-based screening
-  threw them away.
-
-### Root cause
-
-- The original `pre_proc.py` trial reconstruction was too rigid for sparse / irregular
-  AlexRig `BehavState` streams.
-- In other words:
-  the raw files were processable,
-  but the trial-building logic was stricter than the actual state patterns being emitted.
-
-### Fix applied
-
-- Added a fallback trial-recovery path in `pre_proc.py`.
-- The original intertrial-based logic is still attempted first.
-- If that logic finds zero complete trials, the new fallback now:
-  - scans the state stream directly for `START_* -> SUCCESS/FAIL` sequences
-  - builds trial windows from each start state to the next start state
-  - matches `trial_summary` timestamps monotonically into those windows
-  - allows a small time tolerance near the window boundary so summaries that land near the
-    trailing `INTERTRIAL` are not dropped
-
-### Why this fix is safe
-
-- It only activates when the original logic collapses to zero trials.
-- So ordinary recordings that already match the original MATLAB-style assumptions keep using the
-  old path unchanged.
-- The fallback is specifically there for sparse or irregular state streams like the ones seen on
-  `260402`.
-
-### Validation on `260402`
-
-- In-memory validation against the extracted bag/YAML/MAT files showed:
-  - `rec001`: `5` trials recovered
-  - `rec002`: `4` trials recovered
-- That confirms the issue was not missing raw text data.
-- The issue was trial reconstruction in `pre_proc.py`.
-
-### Practical takeaway
-
-- `check_processability.py` means:
-  "the raw capture contains enough embedded text to attempt processing"
-- It does **not** mean:
-  "the current trial matcher will definitely recover trials"
-- If this mismatch appears again in the future, inspect `pre_proc.py` first, especially the
-  assumptions about:
-  - leading / trailing `INTERTRIAL`
-  - exact one-start / one-end trial spans
-  - strict timestamp containment inside intertrial windows
