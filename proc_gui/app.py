@@ -186,10 +186,25 @@ class ProcGuiWindow(QMainWindow):
         self.plot_kind_combo.addItems(["timeseries", "trajectory"])
         self.plot_kind_combo.currentTextChanged.connect(self._schedule_auto_trial_plot)
         trial_form.addRow("Plot", self.plot_kind_combo)
+        self._set_help_text(
+            self.plot_kind_combo,
+            (
+                "Choose the trial figure type.\n\n"
+                "timeseries: joystick_x / joystick_y and reconstructed cursor_x / cursor_y over time, "
+                "with target position and event markers. Use this to inspect timing, movement onset, "
+                "target entry, hold, and reward timing.\n\n"
+                "trajectory: reconstructed cursor path in task space with the target circle and labeled "
+                "trial events. Use this to inspect spatial path shape, target approach, and endpoint."
+            ),
+        )
 
         self.auto_refresh_checkbox = QCheckBox("Auto-refresh trial plot")
         self.auto_refresh_checkbox.setChecked(True)
         trial_form.addRow("", self.auto_refresh_checkbox)
+        self._set_help_text(
+            self.auto_refresh_checkbox,
+            "Automatically regenerate the selected-trial figure when the recording, trial, or plot type changes.",
+        )
 
         controls_layout.addWidget(trial_group)
 
@@ -199,18 +214,62 @@ class ProcGuiWindow(QMainWindow):
         summary_btn = QPushButton("Generate Day Summary")
         summary_btn.clicked.connect(self.generate_day_summary)
         button_layout.addWidget(summary_btn)
+        self._set_help_text(
+            summary_btn,
+            (
+                "Generate the full day-level summary figure set.\n\n"
+                "Outputs:\n"
+                f"- <day>_overview_by_rec.png: trial count and success rate for each recording.\n"
+                f"- <day>_performance_over_time.png: rolling success and trial duration across the session.\n"
+                f"- <day>_display_alignment.png: disStartOn latency distribution and per-recording alignment.\n"
+                f"- <day>_target_performance.png: spatial target success map and target usage density.\n"
+                f"- <day>_success_failure_timing.png: timing distributions for success vs failure.\n"
+                f"- <day>_summary_metrics.json: summary values behind the plots.\n\n"
+                "Use this when you want a high-level view of session quality, performance drift, target-specific "
+                "behavior, and display timing."
+            ),
+        )
 
         validation_btn = QPushButton("Generate Validation Report")
         validation_btn.clicked.connect(self.generate_validation_report)
         button_layout.addWidget(validation_btn)
+        self._set_help_text(
+            validation_btn,
+            (
+                "Generate joystick validation figures for the selected recording.\n\n"
+                "Outputs:\n"
+                "- alignment_summary.png: distributions of event timing error and cursor reconstruction error.\n"
+                "- cursor_shift_sweep.png: how a constant timestamp shift changes cursor error; useful for "
+                "spotting systematic timing offsets.\n"
+                "- trial_<n>_trajectory.png and trial_<n>_timeseries.png for sample trials.\n"
+                "- validation_summary.json: numeric summary including the best constant shift estimate.\n\n"
+                "Use this to check whether behavioral events, joystick timestamps, and reconstructed cursor "
+                "trajectories are internally consistent."
+            ),
+        )
 
         trial_btn = QPushButton("Generate Selected Trial Plot")
         trial_btn.clicked.connect(self.generate_selected_trial_plot)
         button_layout.addWidget(trial_btn)
+        self._set_help_text(
+            trial_btn,
+            (
+                "Generate one figure for the selected trial and plot type.\n\n"
+                "If Plot = timeseries, the output is trial_<n>_timeseries.png showing joystick and reconstructed "
+                "cursor signals over time with event markers.\n"
+                "If Plot = trajectory, the output is trial_<n>_trajectory.png showing the cursor path in task "
+                "space relative to the target.\n\n"
+                "Use this for trial-by-trial inspection after you identify an interesting recording or trial."
+            ),
+        )
 
         refresh_btn = QPushButton("Refresh Output Browser")
         refresh_btn.clicked.connect(self.refresh_output_browser)
         button_layout.addWidget(refresh_btn)
+        self._set_help_text(
+            refresh_btn,
+            "Reload the image list from the current output directory and update the preview pane.",
+        )
 
         controls_layout.addWidget(button_group)
 
@@ -240,6 +299,12 @@ class ProcGuiWindow(QMainWindow):
         widget = QWidget()
         widget.setLayout(layout)
         return widget
+
+    def _set_help_text(self, widget: QWidget, text: str) -> None:
+        widget.setToolTip(text)
+        widget.setStatusTip(text.replace("\n", " "))
+        widget.setWhatsThis(text)
+        widget.setToolTipDuration(20000)
 
     def _browse_day_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Choose day directory")
