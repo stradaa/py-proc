@@ -42,7 +42,7 @@ from pyCheck.joystick_validation import (
     plot_trial_timeseries,
     plot_trial_trajectory,
 )
-from run_day_pipeline import run_day_pipeline
+from py_proc.run_day_pipeline import run_day_pipeline
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp"}
