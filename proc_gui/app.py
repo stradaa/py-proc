@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import io
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
@@ -33,6 +34,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from pyCheck.cross_day_plots import generate_cross_day_plots
 from pyCheck.day_presentation_plots import generate_day_presentation_plots
 from pyCheck.joystick_validation import (
     build_validation_report,
@@ -121,6 +123,7 @@ class ProcGuiWindow(QMainWindow):
         self.current_image: Optional[Path] = None
         self.output_dir_path: Optional[Path] = None
         self.last_auto_out_dir: Optional[Path] = None
+        self.last_auto_cross_day_out_dir: Optional[Path] = None
         self.auto_plot_timer = QTimer(self)
         self.auto_plot_timer.setInterval(350)
         self.auto_plot_timer.setSingleShot(True)
@@ -346,6 +349,78 @@ class ProcGuiWindow(QMainWindow):
 
         tabs.addTab(inspection_tab, "Inspection")
 
+        cross_day_tab = QWidget()
+        cross_day_layout = QVBoxLayout(cross_day_tab)
+
+        cross_day_group = QGroupBox("Cross-Day Summary")
+        cross_day_form = QFormLayout(cross_day_group)
+
+        self.cross_day_recs_edit = QLineEdit()
+        self.cross_day_recs_edit.setPlaceholderText("1-4,6 or blank = all recs in current day")
+        cross_day_form.addRow("Current Day Recs", self.cross_day_recs_edit)
+
+        self.cross_day_available_recs_label = QLabel("Available recs: none")
+        self.cross_day_available_recs_label.setWordWrap(True)
+        cross_day_form.addRow("", self.cross_day_available_recs_label)
+
+        add_day_btn = QPushButton("Add / Update Current Day")
+        add_day_btn.clicked.connect(self.add_cross_day_selection)
+        cross_day_form.addRow("", add_day_btn)
+        self._set_help_text(
+            add_day_btn,
+            (
+                "Add the currently selected day directory to the cross-day comparison list.\n\n"
+                "Uses the Current Day Recs field. Leave it blank to include all recordings found for that day.\n"
+                "Adding the same day again updates its recording selection."
+            ),
+        )
+
+        self.cross_day_selection_list = QListWidget()
+        self.cross_day_selection_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.cross_day_selection_list.setMinimumHeight(240)
+        cross_day_form.addRow("Selected Days", self.cross_day_selection_list)
+
+        cross_day_button_row = QHBoxLayout()
+        remove_day_btn = QPushButton("Remove Selected")
+        remove_day_btn.clicked.connect(self.remove_cross_day_selection)
+        clear_days_btn = QPushButton("Clear All")
+        clear_days_btn.clicked.connect(self.clear_cross_day_selections)
+        cross_day_button_row.addWidget(remove_day_btn)
+        cross_day_button_row.addWidget(clear_days_btn)
+        cross_day_form.addRow("", self._wrap_layout(cross_day_button_row))
+
+        self.cross_day_task_types_edit = QLineEdit()
+        self.cross_day_task_types_edit.setPlaceholderText("joystick_intro, other_task")
+        cross_day_form.addRow("Task Types", self.cross_day_task_types_edit)
+
+        self.cross_day_out_dir_edit = QLineEdit()
+        browse_cross_day_out_btn = QPushButton("Browse")
+        browse_cross_day_out_btn.clicked.connect(self._browse_cross_day_out_dir)
+        cross_day_out_row = QHBoxLayout()
+        cross_day_out_row.addWidget(self.cross_day_out_dir_edit)
+        cross_day_out_row.addWidget(browse_cross_day_out_btn)
+        cross_day_form.addRow("Cross-Day Out", self._wrap_layout(cross_day_out_row))
+
+        cross_day_btn = QPushButton("Generate Cross-Day Summary")
+        cross_day_btn.clicked.connect(self.generate_cross_day_summary)
+        cross_day_form.addRow("", cross_day_btn)
+        self._set_help_text(
+            cross_day_btn,
+            (
+                "Generate cross-day summary figures and metrics for the selected day/recording set.\n\n"
+                "Outputs:\n"
+                "- cross_day_metrics.png: duration, post-entry stability, path efficiency, and successful trials.\n"
+                "- cross_day_summary_metrics.json: selected-run summary.\n"
+                "- cross_day_summary_metrics.csv: cumulative day-by-day metrics that are preserved and updated over time.\n\n"
+                "Use this when you want to compare learning across days while keeping a running CSV as more sessions are collected."
+            ),
+        )
+
+        cross_day_layout.addWidget(cross_day_group)
+        cross_day_layout.addStretch(1)
+
+        tabs.addTab(cross_day_tab, "Cross Day")
+
         self.status_label = QLabel("Ready")
         actions_layout.addWidget(self.status_label)
         actions_layout.addStretch(1)
@@ -405,6 +480,13 @@ class ProcGuiWindow(QMainWindow):
             self.output_dir_path = Path(path).resolve()
             self.refresh_output_browser()
 
+    def _browse_cross_day_out_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose cross-day output directory")
+        if path:
+            self.cross_day_out_dir_edit.setText(path)
+            self.last_auto_cross_day_out_dir = Path(path).resolve()
+            self._load_cross_day_selections_from_csv()
+
     def _sync_day_dir_fields(self) -> None:
         day_dir = self._day_dir_path()
         if day_dir is None:
@@ -424,6 +506,7 @@ class ProcGuiWindow(QMainWindow):
             self.refresh_output_browser()
         self._load_day_notes(day_dir)
         self._populate_rec_choices(day_dir)
+        self._refresh_cross_day_day_context(day_dir)
         self.status_label.setText(f"Loaded day {day_dir.name}")
 
     def _find_day_notes_file(self, day_dir: Path) -> Optional[Path]:
@@ -465,6 +548,50 @@ class ProcGuiWindow(QMainWindow):
                 combo.setEditText("001")
             combo.blockSignals(False)
 
+    def _refresh_cross_day_day_context(self, day_dir: Path) -> None:
+        recs = sorted(p.name for p in day_dir.iterdir() if p.is_dir() and p.name.isdigit())
+        if recs:
+            self.cross_day_available_recs_label.setText("Available recs: " + ", ".join(recs))
+        else:
+            self.cross_day_available_recs_label.setText("Available recs: none")
+
+        expected_out_dir = day_dir.parent / "claude" / "figures" / "cross_day_beh"
+        current_out_dir = self.cross_day_out_dir_edit.text().strip()
+        if not current_out_dir or (self.last_auto_cross_day_out_dir is not None and current_out_dir == str(self.last_auto_cross_day_out_dir)):
+            self.cross_day_out_dir_edit.setText(str(expected_out_dir))
+            self.last_auto_cross_day_out_dir = expected_out_dir
+        self._load_cross_day_selections_from_csv()
+
+    def _cross_day_out_dir_path(self) -> Optional[Path]:
+        text = self.cross_day_out_dir_edit.text().strip()
+        if not text:
+            return None
+        return Path(text).resolve()
+
+    def _cross_day_csv_path(self) -> Optional[Path]:
+        out_dir = self._cross_day_out_dir_path()
+        if out_dir is None:
+            return None
+        return out_dir / "cross_day_summary_metrics.csv"
+
+    def _load_cross_day_selections_from_csv(self) -> None:
+        csv_path = self._cross_day_csv_path()
+        self.cross_day_selection_list.clear()
+        if csv_path is None or not csv_path.exists():
+            return
+        try:
+            with open(csv_path, "r", newline="", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    day = str(row.get("day", "")).strip()
+                    rec_tokens = [token.strip() for token in str(row.get("selected_recs", "")).split(",") if token.strip()]
+                    if not day:
+                        continue
+                    item_text = f"{day}: {','.join(rec_tokens)}" if rec_tokens else day
+                    self.cross_day_selection_list.addItem(item_text)
+        except Exception as exc:
+            self._append_log(f"Could not load cross-day CSV {csv_path}: {exc}")
+
     def _day_dir_path(self) -> Optional[Path]:
         text = self.day_dir_edit.text().strip()
         if not text:
@@ -503,6 +630,26 @@ class ProcGuiWindow(QMainWindow):
 
     def _parse_str_csv(self, text: str) -> list[str]:
         return [part.strip() for part in text.replace(";", ",").split(",") if part.strip()]
+
+    def _parse_rec_spec_text(self, text: str) -> list[int]:
+        cleaned = text.strip()
+        if not cleaned:
+            return []
+        out: list[int] = []
+        for token in [part.strip() for part in cleaned.split(",") if part.strip()]:
+            if "-" in token:
+                start_s, end_s = token.split("-", 1)
+                start_i = int(start_s)
+                end_i = int(end_s)
+                step = 1 if end_i >= start_i else -1
+                out.extend(list(range(start_i, end_i + step, step)))
+            else:
+                out.append(int(token))
+        deduped: list[int] = []
+        for rec in out:
+            if rec not in deduped:
+                deduped.append(rec)
+        return deduped
 
     def _append_log(self, text: str) -> None:
         text = text.strip()
@@ -559,6 +706,43 @@ class ProcGuiWindow(QMainWindow):
         else:
             self.preview.clear_image("No images found in output directory")
 
+    def _set_output_browser_dir(self, out_dir: Path) -> None:
+        self.out_dir_edit.setText(str(out_dir))
+        self.output_dir_path = out_dir
+        self.refresh_output_browser()
+
+    def add_cross_day_selection(self) -> None:
+        day_dir = self._day_dir_path()
+        if day_dir is None:
+            QMessageBox.warning(self, "proc_gui", "Choose a day directory first.")
+            return
+        recs = self._parse_rec_spec_text(self.cross_day_recs_edit.text())
+        if recs:
+            rec_text = ",".join(f"{rec:03d}" for rec in recs)
+            item_text = f"{day_dir.name}: {rec_text}"
+        else:
+            item_text = f"{day_dir.name}"
+
+        existing_row = None
+        for i in range(self.cross_day_selection_list.count()):
+            current_text = self.cross_day_selection_list.item(i).text()
+            current_day = current_text.split(":", 1)[0].strip()
+            if current_day == day_dir.name:
+                existing_row = i
+                break
+        if existing_row is None:
+            self.cross_day_selection_list.addItem(item_text)
+        else:
+            self.cross_day_selection_list.item(existing_row).setText(item_text)
+
+    def remove_cross_day_selection(self) -> None:
+        for item in list(self.cross_day_selection_list.selectedItems()):
+            row = self.cross_day_selection_list.row(item)
+            self.cross_day_selection_list.takeItem(row)
+
+    def clear_cross_day_selections(self) -> None:
+        self.cross_day_selection_list.clear()
+
     def generate_day_summary(self) -> None:
         repo_root, day = self._repo_root_and_day()
         out_dir = self._out_dir_path()
@@ -577,6 +761,35 @@ class ProcGuiWindow(QMainWindow):
             day,
             out_dir,
             exclude_recs,
+            task_types,
+            on_done=_done,
+        )
+
+    def generate_cross_day_summary(self) -> None:
+        day_dir = self._day_dir_path()
+        if day_dir is None:
+            QMessageBox.warning(self, "proc_gui", "Choose a day directory first.")
+            return
+        selections = [self.cross_day_selection_list.item(i).text() for i in range(self.cross_day_selection_list.count())]
+        if not selections:
+            QMessageBox.warning(self, "proc_gui", "Add at least one day to the cross-day selection list.")
+            return
+        out_dir_text = self.cross_day_out_dir_edit.text().strip()
+        out_dir = Path(out_dir_text).resolve() if out_dir_text else day_dir.parent / "claude" / "figures" / "cross_day_beh"
+        task_types = self._parse_str_csv(self.cross_day_task_types_edit.text())
+
+        def _done(result: Any) -> None:
+            self._set_output_browser_dir(out_dir)
+            self._load_cross_day_selections_from_csv()
+            if isinstance(result, dict):
+                self._append_log(json_like(result))
+
+        self._run_worker(
+            "Generating cross-day summary...",
+            generate_cross_day_plots,
+            day_dir.parent,
+            selections,
+            out_dir,
             task_types,
             on_done=_done,
         )
@@ -687,5 +900,5 @@ def json_like(value: Any) -> str:
 def run() -> None:
     app = QApplication([])
     window = ProcGuiWindow()
-    window.show()
+    window.showMaximized()
     app.exec()

@@ -17,6 +17,10 @@ Tools in this folder:
 - `day_presentation_plots.py`
   Generates presentation-style day summaries directly from `AllTrials.mat`, such as:
   `*_overview_by_rec.png`, `*_performance_over_time.png`, `*_target_performance.png`, and `*_summary_metrics.json`.
+- `cross_day_plots.py`
+  Generates cross-day summaries for selected day/recording combinations, including:
+  median successful trial duration by day, hold-break rate, first-entry success rate,
+  median path efficiency, and successful trial count.
 
 Optional GUI:
 - `proc_gui/run_gui.py`
@@ -137,3 +141,33 @@ Notes:
 - The replay is based on reconstructed cursor position from `joystick.mat`, not the camera video.
 - `day_presentation_plots.py` currently uses `Target` ID for target-wise summaries; some days may not have reliable `TargetAngle` or `TargetLocation` fields.
 - If you want to exclude problematic blocks from the day-level summary, pass them via `--exclude-recs`.
+
+Cross-day plot example:
+
+```bash
+./.venv/bin/python pyCheck/cross_day_plots.py \
+  --repo-root /vol/cortex/cd4/pesaranlab/Bowser_Behavior_AlexRig \
+  --day-recs 260330:3-5 \
+  --day-recs 260331:1,2,4,5 \
+  --day-recs 260402:1-4 \
+  --day-recs 260406:3-5 \
+  --day-recs 260407:2-5,7 \
+  --day-recs 260408:1-7 \
+  --day-recs 260409:1-6 \
+  --day-recs 260410:1-5, 7-10 \
+  --day-recs 260415:1,4,5 \
+  --day-recs 260416:1-7 \
+  --task-types joystick_intro
+```
+
+Cross-day selection notes:
+- `--day-recs` is repeatable and lets you choose which recordings belong to each day.
+- Use `260410` with no colon to include all recs found for that day.
+- Use comma-separated and range syntax like `1,2,5-7`.
+- Outputs are written by default to `claude/figures/cross_day_beh`.
+- Cross-day outputs now include `cross_day_metrics.png`, `cross_day_summary_metrics.json`, and `cross_day_summary_metrics.csv`.
+- The duration metric is computed on successful trials as `hold_complete - target_on`.
+- Hold-break rate is computed among trials that reached first target entry.
+- First-entry success means the first target entry reached hold completion before any exit or hold break.
+- Path efficiency is computed on successful trials as cursor path length from `target_on` to `hold_complete`, divided by straight-line distance from cursor position at `target_on` to the target center.
+- The cross-day CSV is cumulative: rerunning with new days adds or updates rows by day instead of discarding the older saved summary rows.
