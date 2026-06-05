@@ -751,7 +751,8 @@ def _populate_joystick(Events, itrial, br, w_drift_ros):
         if isinstance(end_event, dict):
             end_rel_s = _safe_float(end_event.get('time_since_attempt_start_s'))
 
-    Events['Target'][itrial] = _safe_float(final_attempt.get('target_index'))
+    raw_idx = _safe_float(final_attempt.get('target_index'))
+    Events['Target'][itrial] = raw_idx + 1 if np.isfinite(raw_idx) else np.nan
     Events['RewardReceived'][itrial] = 1.0 if str(br.get('final_outcome', '')).lower() == 'success' else 0.0
 
     Events['JoystickTargetOn'][itrial] = _joystick_event_time_ms(

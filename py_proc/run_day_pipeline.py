@@ -51,12 +51,16 @@ def _events_trial_count(events_file: Path) -> int:
         return 0
 
 
+_ALL_STEPS = frozenset({"extract", "events_nodisplay", "detect_display", "full_proc", "save_trials"})
+
+
 def run_day_pipeline(
     day_dir: str | Path,
     skip_video: bool = False,
     skip_existing_video: bool = False,
     no_display: bool = False,
     rec: str | None = None,
+    steps: set[str] | None = None,
 ) -> dict[str, object]:
     repo_root = Path(__file__).resolve().parent
     day_dir = Path(day_dir).expanduser().resolve()
@@ -66,14 +70,22 @@ def run_day_pipeline(
     if not day_dir.exists():
         raise FileNotFoundError(f"Day directory not found: {day_dir}")
 
+    if steps is None:
+        run_steps = set(_ALL_STEPS)
+        if no_display:
+            run_steps -= {"detect_display", "full_proc"}
+    else:
+        run_steps = set(steps)
+
     extract_cmd = [sys.executable, str(repo_root / "procThalamus_indie.py"), "-d", str(day_dir)]
     if skip_video:
         extract_cmd.append("--skip-video")
     if skip_existing_video:
         extract_cmd.append("--skip-existing-video")
 
-    print(f"\n=== Step 1: Extract raw day data from {day_dir} ===")
-    subprocess.run(extract_cmd, check=True, cwd=repo_root)
+    if "extract" in run_steps:
+        print(f"\n=== Step 1: Extract raw day data from {day_dir} ===")
+        subprocess.run(extract_cmd, check=True, cwd=repo_root)
 
     _bootstrap_local_package(repo_root)
 
@@ -86,23 +98,27 @@ def run_day_pipeline(
     from py_proc.proc_saccade import proc_saccade
     from py_proc.save_trials import save_trials
 
-    recs = get_recs(str(day_dir))
-    if not recs:
-        raise RuntimeError(f"No rec folders were created under {day_dir}")
-    if rec is not None:
-        rec = str(rec).zfill(3)
-        if rec not in recs:
-            raise RuntimeError(f"Requested rec {rec} not found under {day_dir}. Available recs: {', '.join(recs)}")
-        recs = [rec]
+    recs: list[str] = []
+    if run_steps - {"extract"}:
+        recs = get_recs(str(day_dir))
+        if not recs:
+            raise RuntimeError(f"No rec folders found under {day_dir}")
+        if rec is not None:
+            rec = str(rec).zfill(3)
+            if rec not in recs:
+                raise RuntimeError(f"Requested rec {rec} not found under {day_dir}. Available: {', '.join(recs)}")
+            recs = [rec]
 
-    print(f"\n=== Step 2: No-display Events pass for {len(recs)} rec(s) ===")
-    for rec in recs:
-        proc_events(day, rec, str(monkeydir), use_display=False)
+    if "events_nodisplay" in run_steps:
+        print(f"\n=== Step 2: No-display Events pass for {len(recs)} rec(s) ===")
+        for rec in recs:
+            proc_events(day, rec, str(monkeydir), use_display=False)
 
-    if not no_display:
+    if "detect_display" in run_steps:
         print(f"\n=== Step 3: Detect display states ===")
         detect_display_states(day, str(monkeydir))
 
+    if "full_proc" in run_steps:
         print(f"\n=== Step 4: Full per-rec processing ===")
         for rec in recs:
             proc_events(day, rec, str(monkeydir), use_display=True)
@@ -115,19 +131,21 @@ def run_day_pipeline(
             proc_hand(day, rec, str(monkeydir))
             proc_reach(day, rec, str(monkeydir))
 
-    print(f"\n=== Step 5: Aggregate trials ===")
-    save_trials(day, str(monkeydir))
+    if "save_trials" in run_steps:
+        print(f"\n=== Step 5: Aggregate trials ===")
+        save_trials(day, str(monkeydir))
 
     print("\nPipeline complete.")
     print(f"Day directory: {day_dir}")
-    print(f"Recs processed: {', '.join(recs)}")
-    print(f"Events path example: {day_dir / recs[0] / f'rec{recs[0]}.Events.mat'}")
+    if recs:
+        print(f"Recs processed: {', '.join(recs)}")
+        print(f"Events path example: {day_dir / recs[0] / f'rec{recs[0]}.Events.mat'}")
     print(f"AllTrials path: {day_dir / 'mat' / 'AllTrials.mat'}")
     print(f"Trials path: {day_dir / 'mat' / 'Trials.mat'}")
     return {
         "day_dir": str(day_dir),
         "recs_processed": recs,
-        "events_example": str(day_dir / recs[0] / f"rec{recs[0]}.Events.mat"),
+        "events_example": str(day_dir / recs[0] / f"rec{recs[0]}.Events.mat") if recs else "",
         "all_trials_path": str(day_dir / "mat" / "AllTrials.mat"),
         "trials_path": str(day_dir / "mat" / "Trials.mat"),
     }

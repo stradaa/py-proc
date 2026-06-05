@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from PyQt6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, pyqtSignal
+from PyQt6.QtCore import QDate, QObject, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -17,6 +20,7 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -28,6 +32,8 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QTextBrowser,
     QTextEdit,
     QVBoxLayout,
@@ -128,6 +134,13 @@ class ProcGuiWindow(QMainWindow):
         self.auto_plot_timer.setInterval(350)
         self.auto_plot_timer.setSingleShot(True)
         self.auto_plot_timer.timeout.connect(self.generate_selected_trial_plot)
+        self._monkey_dir: Optional[Path] = None
+        _s = QSettings("PesaranLab", "ProcGui")
+        _saved = _s.value("ProcGui/monkey_dir", "")
+        if _saved:
+            _candidate = Path(_saved).resolve()
+            if _candidate.is_dir():
+                self._monkey_dir = _candidate
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -202,8 +215,25 @@ class ProcGuiWindow(QMainWindow):
         self.skip_existing_video_checkbox = QCheckBox("Skip existing video outputs")
         processing_form.addRow("", self.skip_existing_video_checkbox)
 
-        self.no_display_checkbox = QCheckBox("No display pass only")
-        processing_form.addRow("", self.no_display_checkbox)
+        steps_container = QWidget()
+        steps_layout = QVBoxLayout(steps_container)
+        steps_layout.setContentsMargins(0, 0, 0, 0)
+        steps_layout.setSpacing(2)
+        self.step_extract_checkbox = QCheckBox("Step 1: Extract")
+        self.step_events_nodisplay_checkbox = QCheckBox("Step 2: Events (no-display)")
+        self.step_detect_display_checkbox = QCheckBox("Step 3: Detect display states")
+        self.step_full_proc_checkbox = QCheckBox("Step 4: Full processing")
+        self.step_save_trials_checkbox = QCheckBox("Step 5: Save trials")
+        for cb in (
+            self.step_extract_checkbox,
+            self.step_events_nodisplay_checkbox,
+            self.step_detect_display_checkbox,
+            self.step_full_proc_checkbox,
+            self.step_save_trials_checkbox,
+        ):
+            cb.setChecked(True)
+            steps_layout.addWidget(cb)
+        processing_form.addRow("Steps", steps_container)
 
         processing_layout.addWidget(processing_group)
 
@@ -431,15 +461,56 @@ class ProcGuiWindow(QMainWindow):
         self.log_view.setReadOnly(True)
         log_layout.addWidget(self.log_view)
 
+        repo_group = QGroupBox("Monkey Repo")
+        repo_layout = QVBoxLayout(repo_group)
+
+        monkey_dir_row = QHBoxLayout()
+        self.monkey_dir_edit = QLineEdit()
+        self.monkey_dir_edit.setPlaceholderText("Monkey directory  (e.g. /cdz/pesaranlab/Eevee_Behavior_AlexRig)")
+        self.monkey_dir_edit.editingFinished.connect(self._on_monkey_dir_changed)
+        browse_monkey_btn = QPushButton("Browse")
+        browse_monkey_btn.clicked.connect(self._browse_monkey_dir)
+        refresh_repo_btn = QPushButton("Refresh")
+        refresh_repo_btn.clicked.connect(self._refresh_day_table)
+        monkey_dir_row.addWidget(self.monkey_dir_edit)
+        monkey_dir_row.addWidget(browse_monkey_btn)
+        monkey_dir_row.addWidget(refresh_repo_btn)
+        repo_layout.addLayout(monkey_dir_row)
+
+        self.day_status_table = QTableWidget(0, 5)
+        self.day_status_table.setHorizontalHeaderLabels(["Day", "Recs", "Events", "AllTrials", "Summary"])
+        self.day_status_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.day_status_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.day_status_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.day_status_table.verticalHeader().setVisible(False)
+        hh = self.day_status_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.day_status_table.cellClicked.connect(self._on_day_table_row_clicked)
+        repo_layout.addWidget(self.day_status_table)
+
+        add_cross_day_btn = QPushButton("Add Selected to Cross-Day")
+        add_cross_day_btn.setToolTip("Add all highlighted rows to the Cross-Day selection list (Ctrl+click to select multiple)")
+        add_cross_day_btn.clicked.connect(self._add_table_days_to_cross_day)
+        repo_layout.addWidget(add_cross_day_btn)
+
+        if self._monkey_dir is not None:
+            self.monkey_dir_edit.setText(str(self._monkey_dir))
+
+        left_splitter.addWidget(repo_group)
         left_splitter.addWidget(inputs_container)
         left_splitter.addWidget(notes_group)
         left_splitter.addWidget(actions_container)
         left_splitter.addWidget(log_group)
-        left_splitter.setStretchFactor(0, 2)
-        left_splitter.setStretchFactor(1, 4)
-        left_splitter.setStretchFactor(2, 5)
-        left_splitter.setStretchFactor(3, 3)
-        left_splitter.setSizes([130, 240, 420, 180])
+        left_splitter.setStretchFactor(0, 3)
+        left_splitter.setStretchFactor(1, 2)
+        left_splitter.setStretchFactor(2, 3)
+        left_splitter.setStretchFactor(3, 5)
+        left_splitter.setStretchFactor(4, 2)
+        left_splitter.setSizes([220, 130, 200, 380, 150])
 
         splitter.addWidget(controls_panel)
 
@@ -456,6 +527,9 @@ class ProcGuiWindow(QMainWindow):
         splitter.setSizes([460, 1040])
         right_splitter.setSizes([260, 780])
 
+        if self._monkey_dir is not None:
+            self._refresh_day_table()
+
     def _wrap_layout(self, layout: QHBoxLayout) -> QWidget:
         widget = QWidget()
         widget.setLayout(layout)
@@ -466,6 +540,168 @@ class ProcGuiWindow(QMainWindow):
         widget.setStatusTip(text.replace("\n", " "))
         widget.setWhatsThis(text)
         widget.setToolTipDuration(20000)
+
+    def _browse_monkey_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose monkey repo directory")
+        if path:
+            self.monkey_dir_edit.setText(path)
+            self._on_monkey_dir_changed()
+
+    def _on_monkey_dir_changed(self) -> None:
+        text = self.monkey_dir_edit.text().strip()
+        if not text:
+            self._monkey_dir = None
+            return
+        candidate = Path(text).resolve()
+        if not candidate.is_dir():
+            return
+        self._monkey_dir = candidate
+        self._refresh_day_table()
+
+    def _scan_day_status(self, monkey_dir: Path) -> list[dict]:
+        days = sorted(
+            [p for p in monkey_dir.iterdir() if p.is_dir() and p.name.isdigit()],
+            key=lambda p: p.name,
+            reverse=True,
+        )
+        results = []
+        for day_path in days:
+            day = day_path.name
+            rec_dirs = sorted(p.name for p in day_path.iterdir() if p.is_dir() and p.name.isdigit())
+            events_complete = [
+                rec for rec in rec_dirs
+                if (day_path / rec / f"rec{rec}.Events.mat").exists()
+            ]
+            all_trials = (day_path / "mat" / "AllTrials.mat").exists()
+            summary_plots = (monkey_dir / "claude" / "figures" / day / "beh" / f"{day}_overview_by_rec.png").exists()
+            has_notes = bool(list(day_path.glob(f"{day}_*.md")))
+            results.append({
+                "day": day,
+                "recs": rec_dirs,
+                "events_complete": events_complete,
+                "all_trials": all_trials,
+                "summary_plots": summary_plots,
+                "has_notes": has_notes,
+            })
+        return results
+
+    def _refresh_day_table(self) -> None:
+        monkey_dir = self._monkey_dir
+        if monkey_dir is None or not monkey_dir.is_dir():
+            self.day_status_table.setRowCount(0)
+            return
+
+        day_records = self._scan_day_status(monkey_dir)
+        self._write_processing_index(monkey_dir, day_records)
+
+        current_day = ""
+        current_day_dir = self._day_dir_path()
+        if current_day_dir is not None and current_day_dir.parent == monkey_dir:
+            current_day = current_day_dir.name
+        if not current_day:
+            today = QDate.currentDate().toString("yyMMdd")
+            if any(r["day"] == today for r in day_records):
+                current_day = today
+            elif day_records:
+                current_day = day_records[0]["day"]
+
+        self.day_status_table.blockSignals(True)
+        self.day_status_table.setRowCount(len(day_records))
+
+        def _cell(text: str) -> QTableWidgetItem:
+            item = QTableWidgetItem(text)
+            item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+            return item
+
+        highlight_row = -1
+        for row, rec in enumerate(day_records):
+            day = rec["day"]
+            recs = rec["recs"]
+            n_recs = len(recs)
+            recs_text = str(n_recs) if n_recs > 0 else "—"
+            events_text = f"{len(rec['events_complete'])}/{n_recs}" if n_recs > 0 else "—"
+            all_trials_text = "✓" if rec["all_trials"] else "—"
+            summary_text = "✓" if rec["summary_plots"] else "—"
+            self.day_status_table.setItem(row, 0, _cell(day))
+            self.day_status_table.setItem(row, 1, _cell(recs_text))
+            self.day_status_table.setItem(row, 2, _cell(events_text))
+            self.day_status_table.setItem(row, 3, _cell(all_trials_text))
+            self.day_status_table.setItem(row, 4, _cell(summary_text))
+            if day == current_day:
+                highlight_row = row
+
+        self.day_status_table.blockSignals(False)
+
+        if highlight_row >= 0:
+            self.day_status_table.selectRow(highlight_row)
+
+        if current_day_dir is None and current_day and day_records and highlight_row >= 0:
+            self._on_day_table_row_clicked(highlight_row, 0)
+
+    def _on_day_table_row_clicked(self, row: int, col: int) -> None:
+        if len(self.day_status_table.selectionModel().selectedRows()) != 1:
+            return
+        day_item = self.day_status_table.item(row, 0)
+        if day_item is None or self._monkey_dir is None:
+            return
+        day = day_item.text()
+        day_path = self._monkey_dir / day
+        if not day_path.is_dir():
+            return
+        self.day_dir_edit.setText(str(day_path))
+        self._sync_day_dir_fields()
+
+    def _add_table_days_to_cross_day(self) -> None:
+        if self._monkey_dir is None:
+            return
+        selected_rows = self.day_status_table.selectionModel().selectedRows()
+        if not selected_rows:
+            QMessageBox.information(self, "proc_gui", "Select one or more days in the table first.")
+            return
+        for index in selected_rows:
+            day_item = self.day_status_table.item(index.row(), 0)
+            if day_item is None:
+                continue
+            day = day_item.text()
+            existing_row = None
+            for i in range(self.cross_day_selection_list.count()):
+                if self.cross_day_selection_list.item(i).text().split(":", 1)[0].strip() == day:
+                    existing_row = i
+                    break
+            if existing_row is None:
+                self.cross_day_selection_list.addItem(day)
+            # if already present, leave it unchanged (preserves any rec spec the user set)
+
+    def _write_processing_index(self, monkey_dir: Path, day_records: list[dict]) -> None:
+        index_path = monkey_dir / "claude" / "processing_index.json"
+        try:
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "monkey_dir": str(monkey_dir),
+                "last_updated": datetime.now().isoformat(timespec="seconds"),
+                "days": {
+                    rec["day"]: {
+                        "recs": rec["recs"],
+                        "events_complete": rec["events_complete"],
+                        "all_trials": rec["all_trials"],
+                        "summary_plots": rec["summary_plots"],
+                        "has_notes": rec["has_notes"],
+                    }
+                    for rec in day_records
+                },
+            }
+            index_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as exc:
+            self._append_log(f"Warning: could not write processing_index.json: {exc}")
+
+    def _highlight_day_table_row(self, day_name: str) -> None:
+        for row in range(self.day_status_table.rowCount()):
+            item = self.day_status_table.item(row, 0)
+            if item is not None and item.text() == day_name:
+                self.day_status_table.blockSignals(True)
+                self.day_status_table.selectRow(row)
+                self.day_status_table.blockSignals(False)
+                return
 
     def _browse_day_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Choose day directory")
@@ -508,6 +744,7 @@ class ProcGuiWindow(QMainWindow):
         self._populate_rec_choices(day_dir)
         self._refresh_cross_day_day_context(day_dir)
         self.status_label.setText(f"Loaded day {day_dir.name}")
+        self._highlight_day_table_row(day_dir.name)
 
     def _find_day_notes_file(self, day_dir: Path) -> Optional[Path]:
         exact = sorted(day_dir.glob(f"{day_dir.name}_*.md"))
@@ -801,8 +1038,18 @@ class ProcGuiWindow(QMainWindow):
             return
         rec_text = self.pipeline_rec_edit.text().strip() or None
 
+        step_map = {
+            "extract": self.step_extract_checkbox,
+            "events_nodisplay": self.step_events_nodisplay_checkbox,
+            "detect_display": self.step_detect_display_checkbox,
+            "full_proc": self.step_full_proc_checkbox,
+            "save_trials": self.step_save_trials_checkbox,
+        }
+        steps = {name for name, cb in step_map.items() if cb.isChecked()} or None
+
         def _done(result: Any) -> None:
             self._sync_day_dir_fields()
+            self._refresh_day_table()
             if isinstance(result, dict):
                 self._append_log(json_like(result))
 
@@ -810,10 +1057,10 @@ class ProcGuiWindow(QMainWindow):
             "Running day pipeline...",
             run_day_pipeline,
             day_dir,
-            self.skip_video_checkbox.isChecked(),
-            self.skip_existing_video_checkbox.isChecked(),
-            self.no_display_checkbox.isChecked(),
-            rec_text,
+            skip_video=self.skip_video_checkbox.isChecked(),
+            skip_existing_video=self.skip_existing_video_checkbox.isChecked(),
+            rec=rec_text,
+            steps=steps,
             on_done=_done,
         )
 
@@ -887,10 +1134,16 @@ class ProcGuiWindow(QMainWindow):
         if self.auto_refresh_checkbox.isChecked():
             self.auto_plot_timer.start()
 
+    def closeEvent(self, event: Any) -> None:
+        s = QSettings("PesaranLab", "ProcGui")
+        if self._monkey_dir is not None:
+            s.setValue("ProcGui/monkey_dir", str(self._monkey_dir))
+        else:
+            s.remove("ProcGui/monkey_dir")
+        super().closeEvent(event)
+
 
 def json_like(value: Any) -> str:
-    import json
-
     try:
         return json.dumps(value, indent=2)
     except Exception:

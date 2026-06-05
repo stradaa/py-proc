@@ -122,8 +122,8 @@ def pre_proc(day, rec, monkeydir, out_suffix=''):
 
     # ---- Timestamps ------------------------------------------------------------
     def _ts(d, sec_field, ns_field):
-        sec = np.asarray(d[sec_field], dtype=np.float64)
-        nsec = np.asarray(d[ns_field], dtype=np.float64)
+        sec = np.atleast_1d(np.asarray(d[sec_field], dtype=np.float64))
+        nsec = np.atleast_1d(np.asarray(d[ns_field], dtype=np.float64))
         return sec + nsec * 1e-9
 
     state_ts = _ts(st, 'header_stamp_sec', 'header_stamp_nanosec')

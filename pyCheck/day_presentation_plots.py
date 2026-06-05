@@ -79,7 +79,7 @@ def _parse_target_config_entry(entry: object) -> List[dict]:
         return []
 
 
-def _target_center_for_trial(target_id: float, config_entry: object) -> Optional[dict]:
+def _target_center_for_trial(target_id: float, config_entry: object, zero_based: bool = False) -> Optional[dict]:
     if not np.isfinite(target_id):
         return None
     targets = _parse_target_config_entry(config_entry)
@@ -87,21 +87,10 @@ def _target_center_for_trial(target_id: float, config_entry: object) -> Optional
         return None
 
     idx = int(round(float(target_id)))
-    if any(int(round(float(tid))) == 0 for tid in [target_id]):
-        zero_based = True
-    else:
-        zero_based = False
-
-    if zero_based:
-        target_idx = idx
-    else:
-        target_idx = idx - 1 if 1 <= idx <= len(targets) else idx
+    target_idx = idx if zero_based else idx - 1
 
     if target_idx < 0 or target_idx >= len(targets):
-        if 0 <= idx < len(targets):
-            target_idx = idx
-        else:
-            return None
+        return None
 
     target = targets[target_idx]
     try:
@@ -265,9 +254,12 @@ def plot_target_performance(
     success = _flat(data, "Success", float)
     config_entries = _flat(data, "TargetConfigs", object)
 
+    valid_ids = target[np.isfinite(target)]
+    zero_based = bool(valid_ids.size > 0 and np.any(np.round(valid_ids).astype(int) == 0))
+
     centers: Dict[tuple, Dict[str, float]] = {}
     for target_id, cfg, succ in zip(target, config_entries, success):
-        info = _target_center_for_trial(target_id, cfg)
+        info = _target_center_for_trial(target_id, cfg, zero_based)
         if info is None:
             continue
         x = info["x"]

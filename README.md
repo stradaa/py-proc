@@ -67,7 +67,10 @@ Launch:
 What it currently supports:
 - select a day directory and auto-detect the matching output folder
 - view the day notes markdown file (`<DAY>_<MONKEY>.md`) directly in the app
-- run `run_day_pipeline.py` from a Processing tab
+- run `run_day_pipeline.py` from a Processing tab with per-step checkboxes:
+  - Step 1: Extract, Step 2: Events (no-display), Step 3: Detect display states,
+    Step 4: Full processing, Step 5: Save trials — any combination can be selected
+  - `run_day_pipeline()` also accepts a `steps: set[str]` parameter for scripted partial runs
 - generate `pyCheck` validation plots and day summary plots from an Inspection tab
 - browse generated figures in the output folder
 
@@ -299,6 +302,60 @@ fit the original logic.
 - `pyCheck/` is the current inspection layer. It reconstructs cursor position from `joystick.mat`,
   validates processed event timing against `behav_result`, renders per-trial timeseries and
   trajectory plots, summarizes display alignment, and generates day-level presentation plots.
+
+---
+
+### `pre_proc.py` — single-trial scalar crash (`numpy.float64` has no `len()`) (2026-06-05)
+
+**Root cause**: `_ts()` used `np.asarray()` to build timestamp arrays from MAT fields. When a
+recording had only one trial, `d[sec_field]` was a scalar, and `np.asarray(scalar)` returns a
+0-dimensional array. Subsequent arithmetic (`w_drift_ros[0] + w_drift_ros[1] * trial_summary_ts`)
+produced a bare `numpy.float64`, which has no `len()` — crashing the `if len(intertrial_times) > 0`
+guard.
+
+**Fix**: Changed `np.asarray(...)` to `np.atleast_1d(np.asarray(...))` inside `_ts()` so the
+result is always at least 1-D regardless of trial count.
+
+**Affected days**: Any rec with exactly one trial (e.g. 260605 rec002).
+
+---
+
+### `proc_events.py` — joystick `Target` field stored 0-based instead of 1-based (2026-06-05)
+
+**Root cause**: `_populate_joystick()` stored `final_attempt['target_index']` directly as
+`Events['Target']`. The joystick task's `target_index` is **0-based** into the full `TargetConfigs`
+list (including disabled targets). Every other task type in `_populate_behav_results()` explicitly
+adds `+1` when writing `Events['Target']`. The inconsistency meant every joystick trial's `Target`
+value was one position too low.
+
+**Consequence**: In `plot_target_performance`, the 1-based index lookup (subtract 1) shifted all
+targets by one slot — enabled targets appeared at disabled targets' positions, the last enabled
+target was cut off entirely, and disabled targets accumulated phantom trial counts.
+
+Concretely on day 260605:
+- "Target 1" (disabled, x=0.17) showed n=62 — actually these were "Top 2" trials
+- "Target 1 Copy" (disabled, x=0.826) showed n=52 — actually "Top 1" trials
+- "Bot" (enabled, x=0.504, y=0.205) never appeared
+
+**Fix**: Added `+1` to `raw_idx` before storing, matching the 1-based convention used everywhere
+else. Affected days must re-run Step 2 (events) and Step 5 (save trials) to regenerate correct
+`Events.mat` and `AllTrials.mat` files.
+
+---
+
+### `day_presentation_plots.py` — per-trial `zero_based` detection in `_target_center_for_trial` (2026-06-05)
+
+**Root cause**: The function determined whether `target_id` was 0-based or 1-based by checking if
+**that single trial's** `target_id` rounded to 0. For a 0-based system where index 0 is a disabled
+target (never selected), no trial would ever have `target_id == 0`, so every trial was incorrectly
+treated as 1-based and had 1 subtracted — compounding the off-by-one from the bug above.
+
+**Fix**: Replaced the per-trial check with a global pre-pass over the full `target` array:
+```python
+valid_ids = target[np.isfinite(target)]
+zero_based = bool(valid_ids.size > 0 and np.any(np.round(valid_ids).astype(int) == 0))
+```
+`zero_based` is now determined once and passed into `_target_center_for_trial` as a parameter.
 
 ---
 
