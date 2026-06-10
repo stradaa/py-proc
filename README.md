@@ -357,6 +357,18 @@ zero_based = bool(valid_ids.size > 0 and np.any(np.round(valid_ids).astype(int) 
 ```
 `zero_based` is now determined once and passed into `_target_center_for_trial` as a parameter.
 
+### `procThalamus_indie.py` / `helpers.py` — `Fs_rec` stored as NIDAQ message rate instead of effective sample rate (2026-06-08)
+
+**Root cause**: `procThalamus_indie.py` applies a `upsample_factor = 30` when writing `recNNN.fiducial.mat` and `recNNN.display.dat`, making both signals live on a 30 kHz grid. However, `recorder_meta.mat` was written with `actual_fs = 1/sample_interval` (the NIDAQ ROS message rate, ~1000 Hz) instead of `1/sample_interval * upsample_factor` (30000 Hz). When no `experiment.mat` exists (e.g. Eevee behavior-only sessions), `get_fs_rec()` in `helpers.py` falls back to this file and returns 1000. That makes `ev_times_rec = edges / Fs_rec` 30× too large in `_compute_and_save_alignment()`, producing `w_drift_ros` slope ≈ 30 instead of ≈ 1 and a false ~1893 ms display latency across all affected sessions.
+
+**Fix**: `procThalamus_indie.py` line 909 now multiplies by `upsample_factor`:
+```python
+actual_fs = (1.0 / sample_interval if sample_interval != sys.maxsize else nidaq_sample_rate) * upsample_factor
+```
+All existing Eevee `recorder_meta.mat` files (44 recs, days 260518–260608) were patched from `Fs_rec = 1000` → `30000`, and `full_proc + save_trials` was rerun for all days.
+
+**Watch for**: Any new animal processed through `procThalamus_indie.py` without a `prototype.experiment.mat` (i.e. no `experiment.mat` generated per rec) will rely on `recorder_meta.mat` for `Fs_rec`. Confirm alignment slope ≈ 1.0 and display latency 50–90 ms on the first processed day.
+
 ---
 
 ## Known Issues / TODO

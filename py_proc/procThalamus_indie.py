@@ -906,7 +906,7 @@ def main():
     # --- Recorder meta ---
     print(rec_dir.name, sample_interval, 1.0 / sample_interval if sample_interval != sys.maxsize else 'unknown')
     recorder_meta_path = rec_dir / f'rec{rec_dir.name}.recorder_meta.mat'
-    actual_fs = 1.0 / sample_interval if sample_interval != sys.maxsize else nidaq_sample_rate
+    actual_fs = (1.0 / sample_interval if sample_interval != sys.maxsize else nidaq_sample_rate) * upsample_factor
     scipy.io.savemat(str(recorder_meta_path), {
       'rec_meta': numpy.array([(actual_fs, 'single')], dtype=REC_META_TYPE)
     })

@@ -5,8 +5,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 from matplotlib.animation import FFMpegWriter
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 from matplotlib.transforms import blended_transform_factory
 import numpy as np
 import yaml
@@ -86,6 +91,118 @@ class JoystickDataset:
         return 1e3 * (self.w_offset_s + self.w_slope * task_s)
 
 
+class CameraReader:
+    """OpenCV video capture with per-frame ROS timestamp index for seeking.
+
+    AVI/MPEG4 notes:
+    - cap.get(CAP_PROP_POS_FRAMES) is unreliable for this codec; we track
+      position internally (_cur_avi_idx) instead.
+    - AVI fps metadata is sometimes wrong (e.g. declared 100fps, actual 80fps).
+      We use avi_frames/mat_frames ratio to scale mat index → AVI index, which
+      correctly spans the full recording regardless of fps metadata errors.
+    """
+
+    def __init__(
+        self,
+        cap: Any,
+        timestamps_ns: np.ndarray,
+    ) -> None:
+        import cv2
+        self._cap = cap
+        self.timestamps_ns = timestamps_ns
+        avi_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self._avi_frames = max(avi_frames, 1)
+        n_mat = len(timestamps_ns)
+        ratio = avi_frames / n_mat if n_mat > 0 else 1.0
+        self._idx_scale = ratio if 0.5 <= ratio <= 8.0 else 1.0
+
+    def perf_to_frame_idx(self, t_perf: float) -> int:
+        # time_perf_counter ≈ ROS CLOCK_MONOTONIC on the same machine — use directly.
+        t_ros_ns = int(t_perf * 1e9)
+        mat_idx = int(np.searchsorted(self.timestamps_ns, t_ros_ns, side="left"))
+        mat_idx = min(max(mat_idx, 0), len(self.timestamps_ns) - 1)
+        return min(int(mat_idx * self._idx_scale), self._avi_frames - 1)
+
+    def read_at_perf(self, t_perf: float) -> Optional[np.ndarray]:
+        import cv2
+        target = self.perf_to_frame_idx(t_perf)
+        current = int(self._cap.get(cv2.CAP_PROP_POS_FRAMES))
+        skip = target - current - 1
+        if 0 <= skip <= 120:
+            for _ in range(skip):
+                self._cap.grab()
+        else:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, float(target))
+        ok, frame = self._cap.read()
+        return frame if ok else None
+
+    def close(self) -> None:
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+
+
+@dataclass
+class ReplaySession:
+    dataset: JoystickDataset
+    cameras: Dict[str, CameraReader]
+    mpl_frames: List[bytes]
+    frame_times: np.ndarray
+    t_start: float
+    t_end: float
+
+    def close(self) -> None:
+        for reader in self.cameras.values():
+            reader.close()
+        self.cameras.clear()
+
+
+def diagnose_camera_sync(session: "ReplaySession", n_samples: int = 12) -> None:
+    """Print timing diagnostics comparing joystick frame_times with camera frame indices.
+
+    Call this from a Python shell after build_replay_session() to verify sync:
+        session = build_replay_session(...)
+        diagnose_camera_sync(session)
+
+    What to look for:
+    - mat_idx should advance ~1 frame per (1/mat_fps) seconds
+    - avi_idx should advance mat_idx * idx_scale frames
+    - elapsed_s at each sample should match the wall-clock seconds from t_start
+    """
+    ft = session.frame_times
+    t0 = ft[0]
+    indices = np.linspace(0, len(ft) - 1, min(n_samples, len(ft)), dtype=int)
+
+    print(f"\n{'idx':>5}  {'elapsed_s':>10}  {'t_perf':>14}", end="")
+    for name in session.cameras:
+        print(f"  {name[:8]:>8}/mat  avi_idx", end="")
+    print()
+    print("-" * (40 + 25 * len(session.cameras)))
+
+    for i in indices:
+        t_perf = ft[i]
+        elapsed = t_perf - t0
+        row = f"{i:5d}  {elapsed:10.3f}  {t_perf:14.3f}"
+        for reader in session.cameras.values():
+            t_ros_ns = int(t_perf * 1e9)
+            mat_idx = int(np.searchsorted(reader.timestamps_ns, t_ros_ns, side="left"))
+            mat_idx = min(max(mat_idx, 0), len(reader.timestamps_ns) - 1)
+            avi_idx = min(int(mat_idx * reader._idx_scale), reader._avi_frames - 1)
+            n_mat = len(reader.timestamps_ns)
+            row += f"  {mat_idx:6d}/{n_mat}  {avi_idx:7d}"
+        print(row)
+
+    print()
+    for name, reader in session.cameras.items():
+        n_mat = len(reader.timestamps_ns)
+        span_s = (reader.timestamps_ns[-1] - reader.timestamps_ns[0]) / 1e9 if n_mat > 1 else 0.0
+        mat_fps = (n_mat - 1) / span_s if span_s > 0 else 0.0
+        print(f"  {name}: {n_mat} mat frames  span={span_s:.1f}s  mat_fps={mat_fps:.1f}"
+              f"  avi_frames={reader._avi_frames}  idx_scale={reader._idx_scale:.2f}")
+    total_s = ft[-1] - ft[0]
+    print(f"  playback window: {total_s:.1f}s  ({len(ft)} frames at {len(ft)/total_s:.1f} fps)\n")
+
+
 def load_joystick_dataset(repo_root: str | Path, day: str, rec: str = "001") -> JoystickDataset:
     root = Path(repo_root).resolve()
     rec_dir = root / day / rec
@@ -125,6 +242,102 @@ def load_joystick_dataset(repo_root: str | Path, day: str, rec: str = "001") -> 
         all_trials=all_trials,
         behav_results=behav_results,
         task_configs=task_configs,
+    )
+
+
+def open_camera_readers(
+    dataset: JoystickDataset,
+    camera_names: Sequence[str] = ("Cam Top", "Cam Left"),
+) -> Dict[str, CameraReader]:
+    import cv2
+
+    day_dir = dataset.root / dataset.day
+    bag_mat = day_dir / dataset.rec / f"rec{dataset.rec}.bag" / "mat"
+    rec_int = int(dataset.rec)
+    readers: Dict[str, CameraReader] = {}
+    for cam in camera_names:
+        mat_path = bag_mat / f"{cam}_image_raw_compressed.mat"
+        if not mat_path.exists():
+            print(f"Camera mat not found: {mat_path}")
+            continue
+        m = loadmat(str(mat_path), simplify_cells=True)
+        timestamps_ns = np.asarray(m["topic_time_stamp"], dtype=np.uint64).ravel()
+        avi_path = day_dir / f"behave.20{dataset.day}.{rec_int}.{cam}.avi"
+        if not avi_path.exists():
+            print(f"Camera video not found: {avi_path}")
+            continue
+        cap = cv2.VideoCapture(str(avi_path))
+        if not cap.isOpened():
+            print(f"Could not open video: {avi_path}")
+            continue
+        readers[cam] = CameraReader(cap=cap, timestamps_ns=timestamps_ns)
+    return readers
+
+
+def build_replay_session(
+    repo_root: str | Path,
+    day: str,
+    rec: str,
+    *,
+    trial_numbers: Optional[Sequence[int]] = None,
+    t_start_rec_s: Optional[float] = None,
+    duration_s: Optional[float] = None,
+    fps: int = 30,
+    playback_speed: float = 1.0,
+    figsize: Tuple[float, float] = (5.5, 5.5),
+    dpi: int = 90,
+    camera_names: Sequence[str] = ("Cam Top", "Cam Left"),
+    pre_s: float = 0.2,
+    post_s: float = 0.3,
+) -> ReplaySession:
+    dataset = load_joystick_dataset(repo_root, day, rec)
+    n_trials = len(dataset.behav_results)
+
+    if trial_numbers is not None:
+        trial_indices = sorted(int(t) - 1 for t in trial_numbers)
+        segments: List[TrialSegment] = []
+        for idx in trial_indices:
+            try:
+                segments.append(get_trial_segment(dataset, idx, pre_s=pre_s, post_s=post_s))
+            except ValueError as exc:
+                print(f"Skipping trial {idx + 1}: {exc}")
+        if not segments:
+            raise ValueError("No valid trials to replay")
+        t_start = segments[0].task_time_s[0]
+        t_end = segments[-1].task_time_s[-1]
+    elif t_start_rec_s is not None and duration_s is not None:
+        rec_origin = float(dataset.joystick_task_s[0])
+        t_start = rec_origin + float(t_start_rec_s)
+        t_end = t_start + float(duration_s)
+        segments = []
+        for idx in range(n_trials):
+            try:
+                seg = get_trial_segment(dataset, idx, pre_s=pre_s, post_s=post_s)
+                if seg.task_time_s[-1] >= t_start and seg.task_time_s[0] <= t_end:
+                    segments.append(seg)
+            except ValueError:
+                pass
+    else:
+        raise ValueError("Provide trial_numbers or (t_start_rec_s, duration_s)")
+
+    dt_frame = playback_speed / float(fps)
+    frame_times = np.arange(t_start, t_end + dt_frame * 0.5, dt_frame)
+
+    fig = Figure(figsize=figsize)
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    fig.subplots_adjust(left=0.13, right=0.97, top=0.94, bottom=0.1)
+
+    mpl_frames = _render_continuous_mpl_frames(segments, fig, ax, frame_times, dpi, dataset)
+    cameras = open_camera_readers(dataset, camera_names)
+
+    return ReplaySession(
+        dataset=dataset,
+        cameras=cameras,
+        mpl_frames=mpl_frames,
+        frame_times=frame_times,
+        t_start=t_start,
+        t_end=t_end,
     )
 
 
@@ -701,7 +914,7 @@ def render_trial_segment(
         ax.set_title(f"Trial {segment.trial_index + 1}")
 
         if t_now >= target_on_time:
-            target = plt.Circle((segment.target_x, segment.target_y), segment.target_radius, color="#4caf50", alpha=0.2)
+            target = mpatches.Circle((segment.target_x, segment.target_y), segment.target_radius, color="#4caf50", alpha=0.2)
             ax.add_patch(target)
 
         visible_mask = segment.task_time_s <= t_now
@@ -750,6 +963,170 @@ def render_trial_segment(
 
         fig.tight_layout()
         writer.grab_frame()
+
+
+def render_trial_replay_frames(
+    repo_root: str | Path,
+    day: str,
+    rec: str,
+    trial_numbers: Sequence[int],
+    fps: int = 30,
+    playback_speed: float = 1.0,
+    figsize: Tuple[float, float] = (5.5, 5.5),
+    dpi: int = 90,
+) -> List[bytes]:
+    """Render trial replay into memory as a list of PNG-encoded frames."""
+    dataset = load_joystick_dataset(repo_root, day, rec)
+    trial_indices = [int(t) - 1 for t in trial_numbers]
+    fig = Figure(figsize=figsize)
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    frames: List[bytes] = []
+    for trial_index in trial_indices:
+        try:
+            segment = get_trial_segment(dataset, trial_index, pre_s=0.2, post_s=0.3)
+        except ValueError as exc:
+            print(f"Skipping trial {trial_index + 1}: {exc}")
+            continue
+        _render_segment_to_frames(segment, fig, ax, frames, fps=fps, playback_speed=playback_speed, dpi=dpi)
+    return frames
+
+
+def _draw_trial_overlay(
+    ax: matplotlib.axes.Axes,
+    segment: TrialSegment,
+    t_now: float,
+    target_on_time: float,
+    end_time: float,
+    labeled_events: List[Dict[str, Any]],
+) -> None:
+    ax.clear()
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.2)
+    ax.set_xlabel("cursor_x (task-region normalized)")
+    ax.set_ylabel("cursor_y (task-region normalized)")
+    ax.set_title(f"Trial {segment.trial_index + 1}")
+
+    if t_now >= target_on_time:
+        ax.add_patch(mpatches.Circle(
+            (segment.target_x, segment.target_y), segment.target_radius,
+            color="#4caf50", alpha=0.2,
+        ))
+
+    visible_mask = segment.task_time_s <= t_now
+    if np.count_nonzero(visible_mask) >= 2:
+        ax.plot(segment.cursor_x[visible_mask], segment.cursor_y[visible_mask], color="#1f77b4", linewidth=2.2)
+
+    cx = float(np.interp(t_now, segment.task_time_s, segment.cursor_x))
+    cy = float(np.interp(t_now, segment.task_time_s, segment.cursor_y))
+    ax.scatter([cx], [cy], s=110, color="#d62728", edgecolor="black", linewidth=0.8, zorder=5)
+
+    shown_events = [ev for ev in labeled_events if ev["time_perf_counter"] <= t_now]
+    for ev in shown_events:
+        ex = float(np.interp(ev["time_perf_counter"], segment.task_time_s, segment.cursor_x))
+        ey = float(np.interp(ev["time_perf_counter"], segment.task_time_s, segment.cursor_y))
+        ax.scatter([ex], [ey], s=28, color=ev["color"], edgecolor="black", linewidth=0.4, zorder=4)
+
+    current_event = shown_events[-1]["label"] if shown_events else "pre_target"
+    ax.text(
+        0.02, 0.98,
+        f"time from target_on: {t_now - target_on_time:+.3f} s\n"
+        f"trial outcome: {segment.attempt.get('outcome', '')}\n"
+        f"current event: {current_event}",
+        transform=ax.transAxes, va="top", ha="left", fontsize=10,
+        bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "#cccccc"},
+    )
+
+    if t_now >= end_time:
+        ax.text(
+            0.98, 0.98, "trial end", transform=ax.transAxes,
+            va="top", ha="right", fontsize=11, color="#222222",
+            bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "#cccccc"},
+        )
+
+
+def _render_continuous_mpl_frames(
+    segments: List[TrialSegment],
+    fig: Figure,
+    ax: matplotlib.axes.Axes,
+    frame_times: np.ndarray,
+    dpi: int,
+    dataset: "JoystickDataset",
+) -> List[bytes]:
+    import io as _io
+
+    seg_data = []
+    for seg in segments:
+        target_on_event = select_attempt_event(seg.attempt, "target_on", "first")
+        end_name = "success" if str(seg.attempt.get("outcome", "")).lower() == "success" else "fail"
+        end_event = select_attempt_event(seg.attempt, end_name, "last")
+        seg_data.append({
+            "seg": seg,
+            "t0": seg.task_time_s[0],
+            "t1": seg.task_time_s[-1],
+            "target_on_time": float(target_on_event["time_perf_counter"]) if target_on_event else seg.task_time_s[0],
+            "end_time": float(end_event["time_perf_counter"]) if end_event else seg.task_time_s[-1],
+            "labeled_events": iter_labeled_attempt_events(seg.attempt),
+        })
+
+    frames: List[bytes] = []
+    for t_now in frame_times:
+        active = next((d for d in seg_data if d["t0"] <= t_now <= d["t1"]), None)
+        if active is not None:
+            _draw_trial_overlay(
+                ax, active["seg"], t_now,
+                active["target_on_time"], active["end_time"], active["labeled_events"],
+            )
+        else:
+            # Between trials: show live cursor position from full dataset so the
+            # joystick overlay stays paired with the camera footage at all times.
+            ax.clear()
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0.0, 1.0)
+            ax.set_aspect("equal", adjustable="box")
+            ax.grid(True, alpha=0.2)
+            ax.set_xlabel("cursor_x (task-region normalized)")
+            ax.set_ylabel("cursor_y (task-region normalized)")
+            ax.set_title("(between trials)")
+            cx = float(np.interp(t_now, dataset.joystick_task_s, dataset.cursor_x))
+            cy = float(np.interp(t_now, dataset.joystick_task_s, dataset.cursor_y))
+            ax.scatter([cx], [cy], s=110, color="#d62728", edgecolor="black",
+                       linewidth=0.8, zorder=5)
+        buf = _io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi)
+        frames.append(buf.getvalue())
+    return frames
+
+
+def _render_segment_to_frames(
+    segment: TrialSegment,
+    fig: Figure,
+    ax: matplotlib.axes.Axes,
+    frames: List[bytes],
+    fps: int,
+    playback_speed: float,
+    dpi: int,
+) -> None:
+    import io as _io
+
+    playback_speed = max(1e-3, float(playback_speed))
+    dt_frame = playback_speed / float(fps)
+    target_on_event = select_attempt_event(segment.attempt, "target_on", "first")
+    end_name = "success" if str(segment.attempt.get("outcome", "")).lower() == "success" else "fail"
+    end_event = select_attempt_event(segment.attempt, end_name, "last")
+    target_on_time = float(target_on_event["time_perf_counter"]) if target_on_event is not None else segment.task_time_s[0]
+    end_time = float(end_event["time_perf_counter"]) if end_event is not None else segment.task_time_s[-1]
+    frame_times = np.arange(segment.task_time_s[0], segment.task_time_s[-1] + dt_frame, dt_frame)
+    labeled_events = iter_labeled_attempt_events(segment.attempt)
+
+    for t_now in frame_times:
+        _draw_trial_overlay(ax, segment, t_now, target_on_time, end_time, labeled_events)
+        fig.tight_layout()
+        buf = _io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi)
+        frames.append(buf.getvalue())
 
 
 def summarize_validation_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
