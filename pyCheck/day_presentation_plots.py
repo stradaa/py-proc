@@ -596,6 +596,27 @@ def generate_day_presentation_plots(
         print(f"Trials kept after task filter: {int(np.sum(keep))} / {len(keep)}")
         data = _filter_trial_rows(data, keep)
 
+    # Display alignment is computed straight from the behave file (photodiode vs
+    # task target_on on the shared record.time clock) rather than from the
+    # legacy recorder-clock AllTrials.disStartOn, which drifts by ~2 s on recent
+    # AlexRig days. Fall back to AllTrials if the behave captures are missing.
+    display_data = data
+    try:
+        from pyCheck.display_behave import day_display_data
+
+        behave_data = day_display_data(
+            repo_root_path / day, exclude_recs=exclude_recs, task_types=task_types
+        )
+        if behave_data["n_matched"] > 0:
+            display_data = behave_data
+            print(f"display_alignment: using behave-direct latencies "
+                  f"({behave_data['n_matched']}/{behave_data['n_trials']} trials matched)")
+        else:
+            print("display_alignment: no behave matches, falling back to AllTrials.disStartOn")
+    except Exception as exc:  # noqa: BLE001 - never let display break the summary
+        print(f"display_alignment: behave-direct failed ({exc}); "
+              f"falling back to AllTrials.disStartOn")
+
     metrics = {
         "session_overview": plot_session_overview(
             data, out_dir_path / f"{day}_overview_by_rec.png", day, exclude_recs
@@ -604,7 +625,7 @@ def generate_day_presentation_plots(
             data, out_dir_path / f"{day}_performance_over_time.png", exclude_recs
         ),
         "display_alignment": plot_display_alignment(
-            data, out_dir_path / f"{day}_display_alignment.png", exclude_recs
+            display_data, out_dir_path / f"{day}_display_alignment.png", exclude_recs
         ),
         "target_performance": plot_target_performance(
             data, out_dir_path / f"{day}_target_performance.png", exclude_recs

@@ -294,7 +294,9 @@ def build_replay_session(
     n_trials = len(dataset.behav_results)
 
     if trial_numbers is not None:
-        trial_indices = sorted(int(t) - 1 for t in trial_numbers)
+        trial_indices = sorted(
+            min(int(t) - 1, n_trials - 1) for t in trial_numbers if int(t) >= 1
+        )
         segments: List[TrialSegment] = []
         for idx in trial_indices:
             try:
@@ -832,26 +834,32 @@ def build_validation_report(
     return summary
 
 
-def parse_trial_tokens(trial_tokens: Optional[Sequence[str]]) -> Optional[List[int]]:
+def parse_trial_tokens(
+    trial_tokens: Optional[Sequence[str]],
+    n_trials: Optional[int] = None,
+) -> Optional[List[int]]:
     if not trial_tokens:
         return None
+    _sentinel = n_trials if n_trials is not None else 99999
     out: List[int] = []
     for token in trial_tokens:
         if "," in token:
             parts = [p.strip() for p in token.split(",") if p.strip()]
-            parsed = parse_trial_tokens(parts)
+            parsed = parse_trial_tokens(parts, n_trials=n_trials)
             if parsed:
                 out.extend(parsed)
             continue
         if "-" in token:
             start_s, end_s = token.split("-", 1)
             start_i = int(start_s)
-            end_i = int(end_s)
+            end_i = _sentinel if end_s.strip().lower() == "end" else int(end_s)
             step = 1 if end_i >= start_i else -1
             out.extend(list(range(start_i, end_i + step, step)))
+        elif token.strip().lower() == "end":
+            out.append(_sentinel)
         else:
             out.append(int(token))
-    deduped = []
+    deduped: List[int] = []
     for trial in out:
         if trial not in deduped:
             deduped.append(trial)

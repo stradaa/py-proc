@@ -135,7 +135,7 @@ Notes:
 - `--out-dir` is optional; if provided, it overrides the default `claude/figures/<day>/beh` path.
 - `--task-types` filters trials by exact `AllTrials.PyTaskType` value, so mixed-task recordings can be summarized without excluding entire recs.
 - `run_joystick_validation.py` now defaults both report figures and replay videos into the same `claude/figures/<day>/beh` folder used by `day_presentation_plots.py`.
-- `display_alignment.png` summarizes `AllTrials.disStartOn`, which is already stored relative to `StartOn` in milliseconds.
+- `display_alignment.png` is computed **directly from the behave file** (`pyCheck/display_behave.py`): the display latency is the first photodiode (`Analog in` / `Dev1/ai1`) rising edge at/after each trial's task `target_on`, both read on the shared `record.time` clock (`target_on.time_perf_counter * 1e9` is already a behave-clock ns — see `pyReplay/README.md`). This replaces the legacy recorder-clock `AllTrials.disStartOn`, which drifted by ~2 s on AlexRig days since 260609. If the behave captures are missing, `generate_day_presentation_plots` falls back to `AllTrials.disStartOn`.
 - `--render-trials` accepts ranges like `10-20`, discrete integers like `4 7 12`, or comma-separated tokens.
 - Output is a single concatenated MP4 replaying the selected trials in order.
 - The replay is based on reconstructed cursor position from `joystick.mat`, not the camera video.
@@ -166,6 +166,8 @@ Cross-day selection notes:
 - Use comma-separated and range syntax like `1,2,5-7`.
 - Outputs are written by default to `claude/figures/cross_day_beh`.
 - Cross-day outputs now include `cross_day_metrics.png`, `cross_day_summary_metrics.json`, and `cross_day_summary_metrics.csv`.
+- A companion **`cross_day_kinematics.png`** (plus `cross_day_kinematics_metrics.json` / `.csv`) is written alongside the headline figure by `cross_day_kinematics.py`. It adds finer-grained motor-learning metrics — movement-time decomposition (reaction / transport / acquisition), reaction-time variability, initial reach-direction error, submovement count, SPARC smoothness, trajectory & endpoint variability, engagement (attempts/trial, idle rate, trials/min), and a direction-resolved success-rate heatmap. All are computed on the task/behave clock (event `time_perf_counter` + reconstructed cursor), like the existing cross-day metrics. Run it standalone with the same `--day-recs` / `--task-types` args as `cross_day_plots.py`, or get it automatically from `generate_cross_day_plots` (the GUI's cross-day button).
+  - Note: in direct control mode `first_joystick_movement` fires almost immediately after `target_on`, so the "reaction" component is near-zero and the **transport time (move→entry) is the meaningful reach-speed metric**.
 - The duration metric is computed on successful trials as `hold_complete - target_on`.
 - Hold-break rate is computed among trials that reached first target entry.
 - First-entry success means the first target entry reached hold completion before any exit or hold break.

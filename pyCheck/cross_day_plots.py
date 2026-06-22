@@ -393,13 +393,29 @@ def generate_cross_day_plots(
     print(f"Saved metrics JSON: {metrics_json_path}")
     print(f"Saved metrics CSV: {metrics_csv_path}")
 
-    return {
+    result = {
         "figure_path": str(figure_path),
         "metrics_json_path": str(metrics_json_path),
         "metrics_csv_path": str(metrics_csv_path),
         "days": rows,
         "csv_days": merged_rows,
     }
+
+    # Companion learning-kinematics figure (separate file, so the headline figure
+    # above stays uncluttered). Guarded: never let it break the core summary.
+    try:
+        from .cross_day_kinematics import generate_cross_day_kinematics
+
+        kin = generate_cross_day_kinematics(
+            repo_root_path, selections, out_dir_path, task_types
+        )
+        result["kinematics_figure_path"] = kin["figure_path"]
+        result["kinematics_metrics_json_path"] = kin["metrics_json_path"]
+        result["kinematics_metrics_csv_path"] = kin["metrics_csv_path"]
+    except Exception as exc:  # noqa: BLE001
+        print(f"cross_day_kinematics: skipped ({exc})")
+
+    return result
 
 
 def main() -> None:

@@ -14,14 +14,12 @@ from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
-    QButtonGroup,
     QCheckBox,
     QComboBox,
-    QRadioButton,
-    QStackedWidget,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -48,29 +46,17 @@ from PyQt6.QtWidgets import (
 from pyCheck.cross_day_plots import generate_cross_day_plots
 from pyCheck.day_presentation_plots import generate_day_presentation_plots
 from pyCheck.joystick_validation import (
-    build_replay_session,
     build_validation_report,
     get_trial_segment,
     load_joystick_dataset,
     parse_trial_tokens,
     plot_trial_timeseries,
     plot_trial_trajectory,
-    render_trial_replay_frames,
-    render_trial_replay_video,
 )
 from py_proc.run_day_pipeline import run_day_pipeline
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp"}
-
-
-def _numpy_bgr_to_pixmap(frame: Any) -> QPixmap:
-    import numpy as np
-    from PyQt6.QtGui import QImage
-    rgb = frame[:, :, ::-1].copy()  # BGR → RGB, ensure contiguous
-    h, w = rgb.shape[:2]
-    qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
-    return QPixmap.fromImage(qimg)
 
 
 class WorkerSignals(QObject):
@@ -137,38 +123,6 @@ class ImagePreview(QScrollArea):
         self.label.setPixmap(scaled)
 
 
-class VideoDisplay(QLabel):
-    def __init__(self) -> None:
-        super().__init__("No replay rendered yet")
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setMinimumSize(QSize(300, 300))
-        self._pixmap: Optional[QPixmap] = None
-
-    def set_frame(self, pixmap: QPixmap) -> None:
-        self._pixmap = pixmap
-        self._refresh_scaled()
-
-    def clear_frame(self, text: str = "No replay rendered yet") -> None:
-        self._pixmap = None
-        self.setPixmap(QPixmap())
-        self.setText(text)
-
-    def resizeEvent(self, event: Any) -> None:
-        super().resizeEvent(event)
-        self._refresh_scaled()
-
-    def _refresh_scaled(self) -> None:
-        if self._pixmap is None:
-            return
-        scaled = self._pixmap.scaled(
-            self.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.setPixmap(scaled)
-
-
 class ProcGuiWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -183,11 +137,8 @@ class ProcGuiWindow(QMainWindow):
         self.auto_plot_timer.setInterval(350)
         self.auto_plot_timer.setSingleShot(True)
         self.auto_plot_timer.timeout.connect(self.generate_selected_trial_plot)
-        self._replay_session: Optional[Any] = None
-        self._replay_frame_idx: int = 0
-        self._replay_fps: int = 30
-        self._replay_timer = QTimer(self)
-        self._replay_timer.timeout.connect(self._replay_tick)
+        self._replay_player: Optional[QWidget] = None
+        self._replay_windows: list[QWidget] = []  # floating ReplayPlayer windows
         self._monkey_dir: Optional[Path] = None
         _s = QSettings("PesaranLab", "ProcGui")
         _saved = _s.value("ProcGui/monkey_dir", "")
@@ -202,14 +153,11 @@ class ProcGuiWindow(QMainWindow):
         self.setCentralWidget(root)
         outer = QHBoxLayout(root)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        outer.addWidget(splitter)
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        outer.addWidget(main_splitter)
 
-        controls_panel = QWidget()
-        controls_layout = QVBoxLayout(controls_panel)
-
-        left_splitter = QSplitter(Qt.Orientation.Vertical)
-        controls_layout.addWidget(left_splitter)
+        # Center column: Inputs (top), action tabs (middle), Output Log (bottom).
+        center_splitter = QSplitter(Qt.Orientation.Vertical)
 
         inputs_container = QWidget()
         inputs_layout = QVBoxLayout(inputs_container)
@@ -251,6 +199,7 @@ class ProcGuiWindow(QMainWindow):
         actions_layout = QVBoxLayout(actions_container)
 
         tabs = QTabWidget()
+        self.tabs = tabs
         actions_layout.addWidget(tabs)
 
         processing_tab = QWidget()
@@ -299,7 +248,7 @@ class ProcGuiWindow(QMainWindow):
         processing_layout.addWidget(processing_button_group)
         processing_layout.addStretch(1)
 
-        tabs.addTab(processing_tab, "Processing")
+        tabs.addTab(self._scroll_wrap(processing_tab), "Processing")
 
         inspection_tab = QWidget()
         inspection_layout = QVBoxLayout(inspection_tab)
@@ -326,7 +275,7 @@ class ProcGuiWindow(QMainWindow):
                 "Outputs:\n"
                 f"- <day>_overview_by_rec.png: trial count and success rate for each recording.\n"
                 f"- <day>_performance_over_time.png: rolling success and trial duration across the session.\n"
-                f"- <day>_display_alignment.png: disStartOn latency distribution and per-recording alignment.\n"
+                f"- <day>_display_alignment.png: display latency (photodiode vs task target_on, read straight from the behave file) distribution and per-recording alignment.\n"
                 f"- <day>_target_performance.png: spatial target success map and target usage density.\n"
                 f"- <day>_success_failure_timing.png: timing distributions for success vs failure.\n"
                 f"- <day>_summary_metrics.json: summary values behind the plots.\n\n"
@@ -431,160 +380,113 @@ class ProcGuiWindow(QMainWindow):
         inspection_layout.addWidget(refresh_btn)
         inspection_layout.addStretch(1)
 
-        tabs.addTab(inspection_tab, "Inspection")
+        tabs.addTab(self._scroll_wrap(inspection_tab), "Inspection")
 
         replay_tab = QWidget()
         replay_layout = QVBoxLayout(replay_tab)
 
-        replay_controls_group = QGroupBox("Replay Controls")
+        replay_controls_group = QGroupBox("pyReplay — load from source behave file")
         replay_controls_form = QFormLayout(replay_controls_group)
 
         self.replay_rec_combo = QComboBox()
         self.replay_rec_combo.setEditable(True)
+        self.replay_rec_combo.setToolTip(
+            "Recording number. The behave capture file behave.<date>.<rec> in the "
+            "current Day Dir is loaded straight from source."
+        )
         replay_controls_form.addRow("Rec", self.replay_rec_combo)
 
-        # Mode selection
-        mode_row = QHBoxLayout()
-        self.replay_mode_trials = QRadioButton("Trials")
-        self.replay_mode_trials.setChecked(True)
-        self.replay_mode_time = QRadioButton("Time Window")
-        self._replay_mode_group = QButtonGroup(self)
-        self._replay_mode_group.addButton(self.replay_mode_trials, 0)
-        self._replay_mode_group.addButton(self.replay_mode_time, 1)
-        mode_row.addWidget(self.replay_mode_trials)
-        mode_row.addWidget(self.replay_mode_time)
-        mode_row.addStretch(1)
-        replay_controls_form.addRow("Mode", self._wrap_layout(mode_row))
-
-        # Stacked inputs: page 0 = trials, page 1 = time window
-        self._replay_input_stack = QStackedWidget()
-
-        trials_page = QWidget()
-        trials_page_layout = QHBoxLayout(trials_page)
-        trials_page_layout.setContentsMargins(0, 0, 0, 0)
-        self.replay_trials_edit = QLineEdit()
-        self.replay_trials_edit.setPlaceholderText("1  or  1-5  or  1 3 7")
-        trials_page_layout.addWidget(self.replay_trials_edit)
-        self._replay_input_stack.addWidget(trials_page)
-
-        time_page = QWidget()
-        time_page_layout = QHBoxLayout(time_page)
-        time_page_layout.setContentsMargins(0, 0, 0, 0)
+        # Time window: start + stop seconds from recording start (pyReplay model).
+        window_row = QHBoxLayout()
         self.replay_start_spin = QDoubleSpinBox()
         self.replay_start_spin.setRange(0.0, 99999.0)
         self.replay_start_spin.setDecimals(2)
         self.replay_start_spin.setSuffix(" s")
-        self.replay_start_spin.setToolTip("Seconds from the start of the recording's first joystick sample")
-        self.replay_duration_spin = QDoubleSpinBox()
-        self.replay_duration_spin.setRange(0.1, 600.0)
-        self.replay_duration_spin.setDecimals(1)
-        self.replay_duration_spin.setValue(30.0)
-        self.replay_duration_spin.setSuffix(" s")
-        time_page_layout.addWidget(QLabel("Start"))
-        time_page_layout.addWidget(self.replay_start_spin)
-        time_page_layout.addSpacing(12)
-        time_page_layout.addWidget(QLabel("Duration"))
-        time_page_layout.addWidget(self.replay_duration_spin)
-        time_page_layout.addStretch(1)
-        self._replay_input_stack.addWidget(time_page)
+        self.replay_start_spin.setToolTip("Window start, seconds from recording start.")
+        self.replay_stop_spin = QDoubleSpinBox()
+        self.replay_stop_spin.setRange(0.1, 99999.0)
+        self.replay_stop_spin.setDecimals(2)
+        self.replay_stop_spin.setValue(30.0)
+        self.replay_stop_spin.setSuffix(" s")
+        self.replay_stop_spin.setToolTip("Window stop, seconds from recording start.")
+        self.replay_to_end_check = QCheckBox("to end")
+        self.replay_to_end_check.setToolTip("Read until the end of the file (ignores Stop).")
+        self.replay_to_end_check.toggled.connect(self.replay_stop_spin.setDisabled)
+        window_row.addWidget(QLabel("Start"))
+        window_row.addWidget(self.replay_start_spin)
+        window_row.addSpacing(12)
+        window_row.addWidget(QLabel("Stop"))
+        window_row.addWidget(self.replay_stop_spin)
+        window_row.addWidget(self.replay_to_end_check)
+        window_row.addStretch(1)
+        replay_controls_form.addRow("Window", self._wrap_layout(window_row))
 
-        self._replay_mode_group.idToggled.connect(
-            lambda bid, checked: self._replay_input_stack.setCurrentIndex(bid) if checked else None
+        opts_row = QHBoxLayout()
+        self.replay_cameras_edit = QLineEdit()
+        self.replay_cameras_edit.setPlaceholderText("auto-detect, or: Cam Top, Cam Left")
+        self.replay_cameras_edit.setToolTip(
+            "Comma-separated camera node names to include. Blank = auto-detect all cameras."
         )
-        replay_controls_form.addRow("", self._replay_input_stack)
+        self.replay_scroll_spin = QDoubleSpinBox()
+        self.replay_scroll_spin.setRange(0.25, 30.0)
+        self.replay_scroll_spin.setSingleStep(0.5)
+        self.replay_scroll_spin.setValue(2.0)
+        self.replay_scroll_spin.setSuffix(" s")
+        self.replay_scroll_spin.setToolTip("Initial trace scroll half-window (adjustable in the player).")
+        opts_row.addWidget(QLabel("Cameras"))
+        opts_row.addWidget(self.replay_cameras_edit, 1)
+        opts_row.addSpacing(12)
+        opts_row.addWidget(QLabel("Scroll ±"))
+        opts_row.addWidget(self.replay_scroll_spin)
+        replay_controls_form.addRow("Options", self._wrap_layout(opts_row))
 
-        fps_speed_row = QHBoxLayout()
-        self.replay_fps_spin = QSpinBox()
-        self.replay_fps_spin.setRange(1, 60)
-        self.replay_fps_spin.setValue(20)
-        fps_speed_row.addWidget(QLabel("FPS"))
-        fps_speed_row.addWidget(self.replay_fps_spin)
-        fps_speed_row.addSpacing(16)
-        self.replay_speed_spin = QDoubleSpinBox()
-        self.replay_speed_spin.setRange(0.1, 10.0)
-        self.replay_speed_spin.setSingleStep(0.5)
-        self.replay_speed_spin.setValue(1.0)
-        fps_speed_row.addWidget(QLabel("Speed"))
-        fps_speed_row.addWidget(self.replay_speed_spin)
-        fps_speed_row.addStretch(1)
-        replay_controls_form.addRow("", self._wrap_layout(fps_speed_row))
-
-        render_replay_btn = QPushButton("Render")
-        render_replay_btn.clicked.connect(self.render_trial_replay)
+        self.load_replay_btn = QPushButton("Load Replay")
+        self.load_replay_btn.clicked.connect(lambda: self.load_pyreplay(as_window=False))
         self._set_help_text(
-            render_replay_btn,
+            self.load_replay_btn,
             (
-                "Render the selected trials or time window into memory.\n\n"
-                "Trials mode: enter a range like 5-12 or individual numbers like 1 3 7.\n"
-                "Time Window mode: enter start (seconds from rec start) and duration.\n\n"
-                "Camera panels (Cam Top, Cam Left) stream live from the AVI files during playback.\n"
-                "Joystick overlay frames are pre-rendered; playback starts automatically."
+                "Load the selected time window straight from the recording's behave capture "
+                "file using the pyReplay pipeline, then show the interactive player below.\n\n"
+                "The player streams cameras + joystick/analog traces synchronized by their "
+                "shared-clock timestamps, with play/seek/speed/scroll controls and MP4 export.\n\n"
+                "Decoding runs in the background; the window appears when it finishes."
             ),
         )
-        replay_controls_form.addRow("", render_replay_btn)
+        self.open_replay_window_btn = QPushButton("Open in Window")
+        self.open_replay_window_btn.clicked.connect(lambda: self.load_pyreplay(as_window=True))
+        self._set_help_text(
+            self.open_replay_window_btn,
+            (
+                "Same as Load Replay, but show the player in its own resizable top-level "
+                "window instead of the embedded panel — useful for seeing all cameras and "
+                "the traces full-size. You can open several at once to compare windows."
+            ),
+        )
+        load_btn_row = QHBoxLayout()
+        load_btn_row.addWidget(self.load_replay_btn)
+        load_btn_row.addWidget(self.open_replay_window_btn)
+        replay_controls_form.addRow("", self._wrap_layout(load_btn_row))
 
-        self.replay_frame_info_label = QLabel("No frames rendered")
-        replay_controls_form.addRow("", self.replay_frame_info_label)
+        self.replay_status_label = QLabel("No replay loaded")
+        self.replay_status_label.setWordWrap(True)
+        replay_controls_form.addRow("", self.replay_status_label)
 
         replay_layout.addWidget(replay_controls_group)
 
-        # 3-panel display: joystick overlay | Cam Top / Cam Left
-        display_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # The embedded pyReplay player is swapped into this container on load.
+        self.replay_player_container = QWidget()
+        replay_player_layout = QVBoxLayout(self.replay_player_container)
+        replay_player_layout.setContentsMargins(0, 0, 0, 0)
+        self.replay_placeholder = QLabel(
+            "Choose a Rec and time window, then click Load Replay.\n"
+            "The interactive pyReplay player will appear here."
+        )
+        self.replay_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.replay_placeholder.setStyleSheet("color:#888;")
+        replay_player_layout.addWidget(self.replay_placeholder)
+        replay_layout.addWidget(self.replay_player_container, 1)
 
-        mpl_panel = QWidget()
-        mpl_layout = QVBoxLayout(mpl_panel)
-        mpl_layout.setContentsMargins(0, 0, 0, 0)
-        mpl_layout.addWidget(QLabel("Joystick Overlay"))
-        self.replay_display = VideoDisplay()
-        mpl_layout.addWidget(self.replay_display, 1)
-        display_splitter.addWidget(mpl_panel)
-
-        cam_splitter = QSplitter(Qt.Orientation.Vertical)
-
-        cam_top_panel = QWidget()
-        cam_top_layout = QVBoxLayout(cam_top_panel)
-        cam_top_layout.setContentsMargins(0, 0, 0, 0)
-        cam_top_layout.addWidget(QLabel("Cam Top"))
-        self.replay_cam_top = VideoDisplay()
-        self.replay_cam_top.clear_frame("No camera data")
-        cam_top_layout.addWidget(self.replay_cam_top, 1)
-        cam_splitter.addWidget(cam_top_panel)
-
-        cam_left_panel = QWidget()
-        cam_left_layout = QVBoxLayout(cam_left_panel)
-        cam_left_layout.setContentsMargins(0, 0, 0, 0)
-        cam_left_layout.addWidget(QLabel("Cam Left"))
-        self.replay_cam_left = VideoDisplay()
-        self.replay_cam_left.clear_frame("No camera data")
-        cam_left_layout.addWidget(self.replay_cam_left, 1)
-        cam_splitter.addWidget(cam_left_panel)
-
-        display_splitter.addWidget(cam_splitter)
-        display_splitter.setStretchFactor(0, 1)
-        display_splitter.setStretchFactor(1, 2)
-        replay_layout.addWidget(display_splitter, 1)
-
-        playback_row = QHBoxLayout()
-        self.replay_play_btn = QPushButton("Play")
-        self.replay_play_btn.setEnabled(False)
-        self.replay_play_btn.clicked.connect(self._replay_play)
-        self.replay_stop_btn = QPushButton("Stop")
-        self.replay_stop_btn.setEnabled(False)
-        self.replay_stop_btn.clicked.connect(self._replay_stop)
-        self.replay_replay_btn = QPushButton("Replay")
-        self.replay_replay_btn.setEnabled(False)
-        self.replay_replay_btn.clicked.connect(self._replay_replay)
-        self.replay_download_btn = QPushButton("Download MP4")
-        self.replay_download_btn.setEnabled(False)
-        self.replay_download_btn.clicked.connect(self._replay_download)
-        playback_row.addWidget(self.replay_play_btn)
-        playback_row.addWidget(self.replay_stop_btn)
-        playback_row.addWidget(self.replay_replay_btn)
-        playback_row.addStretch(1)
-        playback_row.addWidget(self.replay_download_btn)
-        replay_layout.addLayout(playback_row)
-
-        tabs.addTab(replay_tab, "Replay")
+        tabs.addTab(self._scroll_wrap(replay_tab), "Replay")
 
         cross_day_tab = QWidget()
         cross_day_layout = QVBoxLayout(cross_day_tab)
@@ -640,7 +542,12 @@ class ProcGuiWindow(QMainWindow):
 
         cross_day_btn = QPushButton("Generate Cross-Day Summary")
         cross_day_btn.clicked.connect(self.generate_cross_day_summary)
-        cross_day_form.addRow("", cross_day_btn)
+        view_cross_day_btn = QPushButton("View Existing Results")
+        view_cross_day_btn.clicked.connect(lambda: self.view_cross_day_results())
+        cross_day_btn_row = QHBoxLayout()
+        cross_day_btn_row.addWidget(cross_day_btn)
+        cross_day_btn_row.addWidget(view_cross_day_btn)
+        cross_day_form.addRow("", self._wrap_layout(cross_day_btn_row))
         self._set_help_text(
             cross_day_btn,
             (
@@ -652,11 +559,20 @@ class ProcGuiWindow(QMainWindow):
                 "Use this when you want to compare learning across days while keeping a running CSV as more sessions are collected."
             ),
         )
+        self._set_help_text(
+            view_cross_day_btn,
+            (
+                "Load the figures already saved in the Cross-Day Out directory into the figure "
+                "browser on the right, without regenerating anything.\n\n"
+                "Use this to review previously generated cross-day results."
+            ),
+        )
 
         cross_day_layout.addWidget(cross_day_group)
         cross_day_layout.addStretch(1)
 
-        tabs.addTab(cross_day_tab, "Cross Day")
+        self._cross_day_tab_index = tabs.addTab(self._scroll_wrap(cross_day_tab), "Cross Day")
+        tabs.currentChanged.connect(self._on_tab_changed)
 
         self.status_label = QLabel("Ready")
         actions_layout.addWidget(self.status_label)
@@ -707,22 +623,25 @@ class ProcGuiWindow(QMainWindow):
         if self._monkey_dir is not None:
             self.monkey_dir_edit.setText(str(self._monkey_dir))
 
-        left_splitter.addWidget(repo_group)
-        left_splitter.addWidget(inputs_container)
-        left_splitter.addWidget(notes_group)
-        left_splitter.addWidget(actions_container)
-        left_splitter.addWidget(log_group)
-        left_splitter.setStretchFactor(0, 3)
-        left_splitter.setStretchFactor(1, 2)
-        left_splitter.setStretchFactor(2, 3)
-        left_splitter.setStretchFactor(3, 5)
-        left_splitter.setStretchFactor(4, 2)
-        left_splitter.setSizes([220, 130, 200, 380, 150])
+        # Center column stacks Inputs, the action tabs, and the Output Log so
+        # the log is always on screen and the tab area can scroll internally.
+        center_splitter.addWidget(inputs_container)
+        center_splitter.addWidget(actions_container)
+        center_splitter.addWidget(log_group)
+        center_splitter.setStretchFactor(0, 0)
+        center_splitter.setStretchFactor(1, 5)
+        center_splitter.setStretchFactor(2, 2)
+        center_splitter.setSizes([110, 520, 200])
 
-        splitter.addWidget(controls_panel)
+        # Repo table and Day Notes each get their own full-height column.
+        for column in (repo_group, notes_group, center_splitter):
+            column.setMinimumWidth(180)
+
+        self.notes_view.setMinimumWidth(220)
+        repo_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        notes_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         right_splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(right_splitter)
 
         self.image_list = QListWidget()
         self.image_list.itemSelectionChanged.connect(self._show_selected_image)
@@ -730,9 +649,19 @@ class ProcGuiWindow(QMainWindow):
 
         self.preview = ImagePreview()
         right_splitter.addWidget(self.preview)
+        right_splitter.setStretchFactor(0, 0)
+        right_splitter.setStretchFactor(1, 1)
+        right_splitter.setSizes([220, 700])
 
-        splitter.setSizes([460, 1040])
-        right_splitter.setSizes([260, 780])
+        main_splitter.addWidget(repo_group)
+        main_splitter.addWidget(notes_group)
+        main_splitter.addWidget(center_splitter)
+        main_splitter.addWidget(right_splitter)
+        main_splitter.setStretchFactor(0, 2)
+        main_splitter.setStretchFactor(1, 2)
+        main_splitter.setStretchFactor(2, 3)
+        main_splitter.setStretchFactor(3, 4)
+        main_splitter.setSizes([260, 300, 420, 620])
 
         if self._monkey_dir is not None:
             self._refresh_day_table()
@@ -741,6 +670,16 @@ class ProcGuiWindow(QMainWindow):
         widget = QWidget()
         widget.setLayout(layout)
         return widget
+
+    def _scroll_wrap(self, widget: QWidget) -> QScrollArea:
+        """Wrap a tab page so its content scrolls instead of forcing a tall
+        minimum height on the whole window."""
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        area.setWidget(widget)
+        return area
 
     def _set_help_text(self, widget: QWidget, text: str) -> None:
         widget.setToolTip(text)
@@ -1038,6 +977,33 @@ class ProcGuiWindow(QMainWindow):
         except Exception as exc:
             self._append_log(f"Could not load cross-day CSV {csv_path}: {exc}")
 
+    def _remove_days_from_cross_day_csv(self, days_to_remove: set[str]) -> None:
+        """Drop the given days from the persisted cross-day CSV.
+
+        The Selected Days list is just a view rebuilt from this CSV, so a
+        removal that only touches the widget is undone the next time the CSV
+        is reloaded. Persist the removal here so it sticks.
+        """
+        if not days_to_remove:
+            return
+        csv_path = self._cross_day_csv_path()
+        if csv_path is None or not csv_path.exists():
+            return
+        try:
+            with open(csv_path, "r", newline="", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                fieldnames = reader.fieldnames or []
+                kept_rows = [
+                    row for row in reader
+                    if str(row.get("day", "")).strip() not in days_to_remove
+                ]
+            with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(kept_rows)
+        except Exception as exc:
+            self._append_log(f"Could not update cross-day CSV {csv_path}: {exc}")
+
     def _day_dir_path(self) -> Optional[Path]:
         text = self.day_dir_edit.text().strip()
         if not text:
@@ -1182,12 +1148,20 @@ class ProcGuiWindow(QMainWindow):
             self.cross_day_selection_list.item(existing_row).setText(item_text)
 
     def remove_cross_day_selection(self) -> None:
+        removed_days: set[str] = set()
         for item in list(self.cross_day_selection_list.selectedItems()):
+            removed_days.add(item.text().split(":", 1)[0].strip())
             row = self.cross_day_selection_list.row(item)
             self.cross_day_selection_list.takeItem(row)
+        self._remove_days_from_cross_day_csv(removed_days)
 
     def clear_cross_day_selections(self) -> None:
+        all_days = {
+            self.cross_day_selection_list.item(i).text().split(":", 1)[0].strip()
+            for i in range(self.cross_day_selection_list.count())
+        }
         self.cross_day_selection_list.clear()
+        self._remove_days_from_cross_day_csv(all_days)
 
     def generate_day_summary(self) -> None:
         repo_root, day = self._repo_root_and_day()
@@ -1239,6 +1213,27 @@ class ProcGuiWindow(QMainWindow):
             task_types,
             on_done=_done,
         )
+
+    def _on_tab_changed(self, index: int) -> None:
+        if index == self._cross_day_tab_index:
+            self.view_cross_day_results(silent=True)
+
+    def view_cross_day_results(self, silent: bool = False) -> None:
+        out_dir = self._cross_day_out_dir_path()
+        if out_dir is None:
+            day_dir = self._day_dir_path()
+            if day_dir is not None:
+                out_dir = (day_dir.parent / "claude" / "figures" / "cross_day_beh").resolve()
+        if out_dir is None:
+            if not silent:
+                QMessageBox.warning(self, "proc_gui", "Set the Cross-Day Out directory first.")
+            return
+        if not out_dir.exists():
+            if not silent:
+                QMessageBox.warning(self, "proc_gui", f"No results found at:\n{out_dir}")
+            return
+        self._set_output_browser_dir(out_dir)
+        self._append_log(f"Loaded cross-day results from {out_dir}")
 
     def run_processing_pipeline(self) -> None:
         day_dir = self._day_dir_path()
@@ -1343,166 +1338,130 @@ class ProcGuiWindow(QMainWindow):
         if self.auto_refresh_checkbox.isChecked():
             self.auto_plot_timer.start()
 
-    def render_trial_replay(self) -> None:
-        try:
-            repo_root, day = self._repo_root_and_day()
-        except Exception as exc:
-            QMessageBox.warning(self, "proc_gui", str(exc))
+    def _resolve_behave_path(self, day_dir: Path, rec: str) -> Optional[Path]:
+        """Find the behave.*.<rec> capture file in a day directory.
+
+        The Rec combo holds zero-padded names (e.g. '001') matching the rec
+        subdirectories, but capture files use the un-padded rec number as the
+        suffix (e.g. behave.20260609.1). Mirrors run_replay._resolve_behave and
+        tries both forms.
+        """
+        rec = rec.strip()
+        candidates = [rec]
+        if rec.isdigit():
+            candidates.append(str(int(rec)))
+        for r in dict.fromkeys(candidates):  # dedupe, preserve order
+            matches = sorted(p for p in day_dir.glob(f"behave.*.{r}") if p.suffix == f".{r}")
+            if matches:
+                return matches[0]
+        return None
+
+    def load_pyreplay(self, as_window: bool = False) -> None:
+        day_dir = self._day_dir_path()
+        if day_dir is None or not day_dir.is_dir():
+            QMessageBox.warning(self, "proc_gui", "Choose a valid Day Dir first.")
             return
         rec = self.replay_rec_combo.currentText().strip()
         if not rec:
             QMessageBox.warning(self, "proc_gui", "Choose a recording.")
             return
-        fps = int(self.replay_fps_spin.value())
-        speed = float(self.replay_speed_spin.value())
-
-        mode = self._replay_mode_group.checkedId()
-        if mode == 0:
-            trials_text = self.replay_trials_edit.text().strip()
-            trial_numbers = parse_trial_tokens(trials_text.split()) if trials_text else [1]
-            kwargs: dict = dict(trial_numbers=trial_numbers)
-        else:
-            kwargs = dict(
-                t_start_rec_s=float(self.replay_start_spin.value()),
-                duration_s=float(self.replay_duration_spin.value()),
+        behave = self._resolve_behave_path(day_dir, rec)
+        if behave is None:
+            QMessageBox.warning(
+                self, "proc_gui", f"No behave.*.{rec} capture file found in {day_dir}."
             )
-
-        self.replay_play_btn.setEnabled(False)
-        self.replay_stop_btn.setEnabled(False)
-        self.replay_replay_btn.setEnabled(False)
-        self.replay_download_btn.setEnabled(False)
-        self.replay_frame_info_label.setText("Rendering joystick overlay…")
-        self.replay_display.clear_frame("Rendering…")
-        self.replay_cam_top.clear_frame("Loading…")
-        self.replay_cam_left.clear_frame("Loading…")
-        self._replay_timer.stop()
-        if self._replay_session is not None:
-            self._replay_session.close()
-            self._replay_session = None
-
-        def _done(session: Any) -> None:
-            self._on_replay_session_ready(session, fps)
-
-        self._run_worker(
-            "Rendering replay...",
-            build_replay_session,
-            repo_root, day, rec,
-            fps=fps, playback_speed=speed,
-            on_done=_done,
-            **kwargs,
-        )
-
-    def _on_replay_session_ready(self, session: Any, fps: int) -> None:
-        if session is None or not session.mpl_frames:
-            self.replay_frame_info_label.setText("No frames rendered.")
-            self.replay_display.clear_frame("No frames returned.")
             return
-        self._replay_session = session
-        self._replay_frame_idx = 0
-        self._replay_fps = fps
 
-        if not session.cameras:
-            self.replay_cam_top.clear_frame("No camera data")
-            self.replay_cam_left.clear_frame("No camera data")
+        start_s = float(self.replay_start_spin.value())
+        if self.replay_to_end_check.isChecked():
+            stop_s = 999_999.0  # pyReplay sentinel for "end of file"
         else:
-            if "Cam Top" not in session.cameras:
-                self.replay_cam_top.clear_frame("Cam Top not found")
-            if "Cam Left" not in session.cameras:
-                self.replay_cam_left.clear_frame("Cam Left not found")
+            stop_s = float(self.replay_stop_spin.value())
+            if stop_s <= start_s:
+                QMessageBox.warning(self, "proc_gui", "Stop must be greater than Start.")
+                return
 
-        self.replay_download_btn.setEnabled(True)
-        self.replay_replay_btn.setEnabled(True)
-        self._replay_show_frame(0)
-        self._replay_play()
+        cameras_text = self.replay_cameras_edit.text().strip()
+        camera_names = [c.strip() for c in cameras_text.split(",") if c.strip()] or None
+        scroll_s = float(self.replay_scroll_spin.value())
 
-    def _replay_show_frame(self, idx: int) -> None:
-        session = self._replay_session
-        if session is None or idx >= len(session.mpl_frames):
+        # load_window decodes video — run it off the UI thread. ReplayPlayer is
+        # built on the UI thread once the window is ready. Imported lazily so
+        # app.py stays importable without the thalamus/Qt stack present.
+        from pyReplay.loader import load_window
+
+        stop_label = "end" if stop_s >= 999_999.0 else f"{stop_s:g}s"
+        self.replay_status_label.setText(f"Loading {behave.name}  [{start_s:g}s – {stop_label}] …")
+        self.load_replay_btn.setEnabled(False)
+        self.open_replay_window_btn.setEnabled(False)
+        self._set_busy("Loading replay from source…")
+
+        worker = Worker(load_window, str(behave), start_s, stop_s, camera_names=camera_names)
+        worker.signals.finished.connect(
+            lambda win, logs: self._on_pyreplay_loaded(win, logs, scroll_s, as_window)
+        )
+        worker.signals.error.connect(self._on_pyreplay_error)
+        self.thread_pool.start(worker)
+
+    def _on_pyreplay_loaded(self, win: Any, logs: str, scroll_s: float, as_window: bool) -> None:
+        self._append_log(logs)
+        self._set_ready()
+        self.load_replay_btn.setEnabled(True)
+        self.open_replay_window_btn.setEnabled(True)
+        if win is None:
+            self.replay_status_label.setText("Load returned no data — see Output Log.")
             return
-        pixmap = QPixmap()
-        pixmap.loadFromData(session.mpl_frames[idx])
-        self.replay_display.set_frame(pixmap)
 
-        t_now = float(session.frame_times[idx])
-        for cam_name, display in (("Cam Top", self.replay_cam_top), ("Cam Left", self.replay_cam_left)):
-            reader = session.cameras.get(cam_name)
-            if reader is None:
-                continue
-            frame = reader.read_at_perf(t_now)
-            if frame is not None:
-                display.set_frame(_numpy_bgr_to_pixmap(frame))
+        from pyReplay.player import ReplayPlayer
 
-        n = len(session.mpl_frames)
-        self.replay_frame_info_label.setText(f"Frame {idx + 1} / {n}  t={t_now:.2f} s")
+        if as_window:
+            # Top-level window: full-size, resizable, several can coexist.
+            player = ReplayPlayer(win, scroll_s=scroll_s)
+            player.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            player.destroyed.connect(lambda _=None, p=player: self._forget_replay_window(p))
+            self._replay_windows.append(player)
+            player.show()
+            player.raise_()
+        else:
+            self._teardown_replay_player()
+            if self.replay_placeholder is not None:
+                self.replay_placeholder.setParent(None)
+                self.replay_placeholder.deleteLater()
+                self.replay_placeholder = None
+            player = ReplayPlayer(win, scroll_s=scroll_s)
+            self.replay_player_container.layout().addWidget(player)
+            self._replay_player = player
 
-    def _replay_play(self) -> None:
-        if self._replay_session is None:
-            return
-        self.replay_play_btn.setEnabled(False)
-        self.replay_stop_btn.setEnabled(True)
-        self._replay_timer.start(max(1, int(1000 / self._replay_fps)))
-
-    def _replay_stop(self) -> None:
-        self._replay_timer.stop()
-        self.replay_play_btn.setEnabled(self._replay_session is not None)
-        self.replay_stop_btn.setEnabled(False)
-
-    def _replay_replay(self) -> None:
-        self._replay_timer.stop()
-        self._replay_frame_idx = 0
-        self._replay_show_frame(0)
-        self._replay_play()
-
-    def _replay_tick(self) -> None:
-        session = self._replay_session
-        if session is None:
-            self._replay_timer.stop()
-            return
-        self._replay_frame_idx += 1
-        if self._replay_frame_idx >= len(session.mpl_frames):
-            self._replay_timer.stop()
-            self._replay_frame_idx = len(session.mpl_frames) - 1
-            self.replay_play_btn.setEnabled(True)
-            self.replay_stop_btn.setEnabled(False)
-            return
-        self._replay_show_frame(self._replay_frame_idx)
-
-    def _replay_download(self) -> None:
         try:
-            repo_root, day = self._repo_root_and_day()
-        except Exception as exc:
-            QMessageBox.warning(self, "proc_gui", str(exc))
-            return
-        rec = self.replay_rec_combo.currentText().strip()
-        if not rec:
-            QMessageBox.warning(self, "proc_gui", "Choose a recording.")
-            return
-        out_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Replay MP4", f"replay_{day}_{rec}.mp4", "MP4 Video (*.mp4)"
-        )
-        if not out_path:
-            return
-        trials_text = self.replay_trials_edit.text().strip()
-        trial_numbers = parse_trial_tokens(trials_text.split()) if trials_text else [1]
-        fps = int(self.replay_fps_spin.value())
-        speed = float(self.replay_speed_spin.value())
+            self.replay_status_label.setText(win.summary().splitlines()[0])
+        except Exception:
+            self.replay_status_label.setText("Replay loaded.")
 
-        def _done(result: Any) -> None:
-            if isinstance(result, Path):
-                self._append_log(f"Saved replay to {result}")
+    def _forget_replay_window(self, player: QWidget) -> None:
+        if player in self._replay_windows:
+            self._replay_windows.remove(player)
 
-        self._run_worker(
-            "Saving MP4...",
-            render_trial_replay_video,
-            repo_root, day, rec, trial_numbers, out_path,
-            fps=fps, playback_speed=speed,
-            on_done=_done,
-        )
+    def _on_pyreplay_error(self, error_text: str) -> None:
+        self._append_log(error_text)
+        self._set_ready("Error")
+        self.load_replay_btn.setEnabled(True)
+        self.open_replay_window_btn.setEnabled(True)
+        self.replay_status_label.setText("Load failed — see Output Log.")
+        QMessageBox.critical(self, "proc_gui", error_text)
+
+    def _teardown_replay_player(self) -> None:
+        if self._replay_player is not None:
+            timer = getattr(self._replay_player, "timer", None)
+            if timer is not None:
+                timer.stop()
+            self._replay_player.setParent(None)
+            self._replay_player.deleteLater()
+            self._replay_player = None
 
     def closeEvent(self, event: Any) -> None:
-        if self._replay_session is not None:
-            self._replay_session.close()
-            self._replay_session = None
+        self._teardown_replay_player()
+        for player in list(self._replay_windows):
+            player.close()
         s = QSettings("PesaranLab", "ProcGui")
         if self._monkey_dir is not None:
             s.setValue("ProcGui/monkey_dir", str(self._monkey_dir))
