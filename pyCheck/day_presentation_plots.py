@@ -10,6 +10,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.io import loadmat
 
+from pyCheck.day_behavior_metrics import (
+    plot_engagement,
+    plot_failure_modes,
+    plot_kinematic_intervals,
+    plot_overshoot_attempts,
+)
+from pyCheck.plot_utils import _flat, _save_figure, _title_suffix
+
 
 def _load_all_trials(repo_root: Path, day: str) -> Dict[str, np.ndarray]:
     all_trials = loadmat(repo_root / day / "mat" / "AllTrials.mat", simplify_cells=True)["AllTrials"]
@@ -17,13 +25,6 @@ def _load_all_trials(repo_root: Path, day: str) -> Dict[str, np.ndarray]:
     for key, value in all_trials.items():
         out[key] = np.asarray(value)
     return out
-
-
-def _flat(data: Dict[str, np.ndarray], key: str, dtype=float) -> np.ndarray:
-    value = np.asarray(data[key]).ravel()
-    if dtype is object:
-        return value.astype(object)
-    return value.astype(dtype)
 
 
 def _rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
@@ -102,21 +103,6 @@ def _target_center_for_trial(target_id: float, config_entry: object, zero_based:
         }
     except Exception:
         return None
-
-
-def _title_suffix(exclude_recs: List[int]) -> str:
-    if not exclude_recs:
-        return ""
-    rec_text = ", ".join(f"rec{rec:03d}" for rec in sorted(exclude_recs))
-    plural = "s" if len(exclude_recs) > 1 else ""
-    return f" (excluded rec{plural}: {rec_text})"
-
-
-def _save_figure(fig: plt.Figure, out_path: Path, label: str) -> None:
-    print(f"Generating figure: {label}")
-    fig.savefig(out_path, dpi=180)
-    print(f"Saved figure: {out_path}")
-    plt.close(fig)
 
 
 def _longest_success_streak(success: np.ndarray) -> Dict[str, float]:
@@ -400,44 +386,53 @@ def plot_success_failure_timing(
             "failure_median_s": float(np.nanmedian(failure_vals)) if len(failure_vals) else float("nan"),
         }
 
-    fig, ax = plt.subplots(figsize=(10.2, 5.4))
-    pos = np.arange(len(labels), dtype=float)
+    n_panels = len(labels)
+    fig, axes = plt.subplots(2, 2, figsize=(11.0, 7.4))
+    axes = np.asarray(axes).ravel()
 
-    def _plot_group(groups: List[np.ndarray], positions: np.ndarray, face: str, edge: str) -> None:
-        valid_idx = [i for i, g in enumerate(groups) if len(g) > 0]
-        if valid_idx:
-            parts = ax.violinplot([groups[i] for i in valid_idx],
-                                  positions=positions[valid_idx],
-                                  widths=0.28,
-                                  showmedians=True)
-            for body in parts["bodies"]:
-                body.set_facecolor(face)
-                body.set_edgecolor(edge)
-                body.set_alpha(0.55)
-            parts["cmedians"].set_color(edge)
+    for ax, label, svals, fvals in zip(axes, labels, success_data, failure_data):
+        combined = np.concatenate([v for v in (svals, fvals) if len(v)]) if (len(svals) or len(fvals)) else np.array([])
+        if combined.size == 0:
+            ax.text(0.5, 0.5, f"No valid {label} values", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(label)
+            continue
 
-    _plot_group(success_data, pos - 0.18, "#54a24b", "#1b5e20")
-    _plot_group(failure_data, pos + 0.18, "#e45756", "#7f0000")
+        lo = float(np.nanmin(combined))
+        # Clip the upper edge to a robust percentile so heavy right-skew (e.g.
+        # timeout failures) does not crush the informative bulk into one bin.
+        hi = float(np.nanpercentile(combined, 99))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            hi = lo + 1.0
+        n_outliers = int(np.sum(combined > hi))
+        n_bins = int(np.clip(np.sqrt(combined.size) * 2.0, 12, 40))
+        bins = np.linspace(lo, hi, n_bins + 1)
 
-    for i, (svals, fvals) in enumerate(zip(success_data, failure_data)):
+        def _clip(vals: np.ndarray) -> np.ndarray:
+            # Pile values beyond the cutoff into the last bin rather than dropping them.
+            return np.clip(vals, lo, hi) if len(vals) else vals
+
         if len(svals):
-            ax.scatter(np.full(len(svals), pos[i] - 0.18), svals, s=8, alpha=0.15, color="#1b5e20")
+            ax.hist(_clip(svals), bins=bins, color="#54a24b", alpha=0.55, edgecolor="white", label=f"success (n={len(svals)})")
+            smed = float(np.nanmedian(svals))
+            ax.axvline(smed, color="#1b5e20", linewidth=2, label=f"median {smed:.2f} s")
         if len(fvals):
-            ax.scatter(np.full(len(fvals), pos[i] + 0.18), fvals, s=8, alpha=0.15, color="#7f0000")
+            ax.hist(_clip(fvals), bins=bins, color="#e45756", alpha=0.55, edgecolor="white", label=f"failure (n={len(fvals)})")
+            fmed = float(np.nanmedian(fvals))
+            ax.axvline(fmed, color="#7f0000", linewidth=2, linestyle="--", label=f"median {fmed:.2f} s")
+        if n_outliers:
+            ax.text(0.98, 0.60, f"{n_outliers} trial(s) > {hi:.0f} s\n(piled in last bin)",
+                    ha="right", va="top", transform=ax.transAxes, fontsize=6.5, color="#555555")
 
-    ax.set_xticks(pos)
-    ax.set_xticklabels(labels)
-    ax.set_ylabel("Latency from StartOn (s)")
-    ax.set_title(f"Success vs failure timing{_title_suffix(exclude_recs)}")
-    ax.grid(axis="y", alpha=0.2)
+        ax.set_title(label)
+        ax.set_xlabel("Latency from StartOn (s)")
+        ax.set_ylabel("Trial count")
+        ax.grid(axis="y", alpha=0.2)
+        ax.legend(frameon=False, fontsize=7.5, loc="upper right")
 
-    from matplotlib.lines import Line2D
-    legend_items = [
-        Line2D([0], [0], color="#54a24b", lw=8, alpha=0.6, label="Successful trials"),
-        Line2D([0], [0], color="#e45756", lw=8, alpha=0.6, label="Failed trials"),
-    ]
-    ax.legend(handles=legend_items, loc="upper left", frameon=False)
+    for ax in axes[n_panels:]:
+        ax.set_visible(False)
 
+    fig.suptitle(f"Success vs failure timing{_title_suffix(exclude_recs)}")
     fig.tight_layout()
     _save_figure(fig, out_path, "success vs failure timing")
 
@@ -632,6 +627,18 @@ def generate_day_presentation_plots(
         ),
         "success_failure_timing": plot_success_failure_timing(
             data, out_dir_path / f"{day}_success_failure_timing.png", exclude_recs
+        ),
+        "kinematic_intervals": plot_kinematic_intervals(
+            data, out_dir_path / f"{day}_kinematic_intervals.png", exclude_recs
+        ),
+        "failure_modes": plot_failure_modes(
+            data, out_dir_path / f"{day}_failure_modes.png", exclude_recs
+        ),
+        "overshoot_attempts": plot_overshoot_attempts(
+            data, out_dir_path / f"{day}_overshoot_attempts.png", exclude_recs
+        ),
+        "engagement": plot_engagement(
+            data, out_dir_path / f"{day}_engagement.png", exclude_recs
         ),
     }
 
