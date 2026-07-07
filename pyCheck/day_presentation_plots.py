@@ -642,6 +642,18 @@ def generate_day_presentation_plots(
         ),
     }
 
+    # Structured center-out outputs (schedule_phase-tagged attempts). Skipped
+    # for days recorded before the schedule feature; never breaks the summary.
+    try:
+        from pyCheck.co_structured import generate_co_structured_outputs
+
+        metrics["co_structured"] = generate_co_structured_outputs(
+            repo_root_path, day, out_dir=out_dir_path, exclude_recs=exclude_recs
+        )
+    except Exception as exc:  # noqa: BLE001 - never let co_structured break the summary
+        print(f"co_structured: failed ({exc}); continuing without it")
+        metrics["co_structured"] = {"error": str(exc)}
+
     metrics_path = out_dir_path / f"{day}_summary_metrics.json"
     with open(metrics_path, "w", encoding="utf-8") as fh:
         json.dump(metrics, fh, indent=2)

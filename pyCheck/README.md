@@ -23,6 +23,13 @@ Tools in this folder:
   already in `AllTrials.mat`: `*_kinematic_intervals.png` (reaction / movement / hold-duration histograms),
   `*_failure_modes.png` (why failed trials failed, per rec), `*_overshoot_attempts.png` (target re-entry rate and
   attempts per trial), and `*_engagement.png` (inter-trial interval, cumulative trials vs rewards, trial rate per rec).
+- `co_structured.py`
+  Structured center-out (CO) outputs for days recorded with the Rust executor's target schedule: separates
+  `schedule_phase`-tagged attempts (`center` / `peripheral` / `sequence` vs `random` inserts), writes
+  `*_co_structured.png` (reach paths + performance bars), `*_co_structured_attempts.csv` (one row per attempt),
+  and `*_co_structured_paths.npz` (full cursor/joystick paths). Runs automatically inside
+  `generate_day_presentation_plots` (skipped when a day has no `schedule_phase` data) or standalone via
+  `python -m pyCheck.co_structured` with the same `--repo-root/--day/--day-dir/--out-dir/--exclude-recs` args.
 - `plot_utils.py`
   Small shared helpers (`_flat`, `_save_figure`, `_title_suffix`) used by both day-plot modules.
 - `cross_day_plots.py`
@@ -143,6 +150,8 @@ Inside that folder it writes:
 - `260331_overshoot_attempts.png` — target re-entry rate per rec and attempts-per-trial distribution
 - `260331_engagement.png` — inter-trial interval, cumulative trials vs rewards, and trial rate per rec
 - `260331_summary_metrics.json`
+- `260331_co_structured.png` / `_co_structured_attempts.csv` / `_co_structured_paths.npz` — only for days whose
+  attempts carry `schedule_phase` (Rust executor target schedule); see "Structured center-out outputs" below
 
 Notes:
 - `--out-dir` is optional; if provided, it overrides the default `claude/figures/<day>/beh` path.
@@ -191,6 +200,44 @@ stage it reached, so you can see *why* trials fail rather than just the failure 
 - **Cumulative trials vs rewards** — diverging lines show reward-rate drift over the day.
 - **Trial rate by recording** — trials/min per rec from the `StartOn` span, flagging blocks where the subject
   slowed down.
+
+## Structured center-out outputs
+
+`co_structured.py` separates structured trials from random inserts using the per-attempt `schedule_phase`
+field the Rust joystick executor writes into `behav_result["attempts"]` (`center` / `peripheral` in
+center-out mode, `sequence` in sequence mode, `random` for Random mode, interleave inserts, and fallback
+picks). It reads attempts straight from `recNNN.ev.mat` `behav_results` — no pipeline or `AllTrials.mat`
+schema change — and reconstructs each attempt's cursor path from `joystick.mat`.
+
+Outputs (same `claude/figures/<day>/beh` folder):
+- **`<day>_co_structured.png`** — four panels: structured peripheral reaches colored per target, center
+  (return) reaches, random-insert reaches in gray, and success-rate bars (per peripheral target, structured
+  vs random overall, and center→peripheral pair completion).
+- **`<day>_co_structured_attempts.csv`** — one row per `schedule_phase` attempt:
+  `day, rec, trial_index, attempt_index, schedule_phase, outcome, failure_reason, target_index, target_name,
+  target_x, target_y, target_radius, t_target_on, t_end, duration_s, pair_id, pair_complete, path_row`.
+  `pair_id >= 0` groups an adjacent center→peripheral pair; `path_row` indexes into the NPZ (−1 = no path).
+- **`<day>_co_structured_paths.npz`** — pickle-free ragged path storage: concatenated `task_time_s`,
+  `cursor_x`, `cursor_y`, `joystick_x`, `joystick_y` plus `row_start` / `row_len`. Reconstruct row `k` with
+  `sl = slice(row_start[k], row_start[k] + row_len[k])`, e.g.:
+
+  ```python
+  import numpy as np, csv
+  npz = np.load("260707_co_structured_paths.npz")
+  with open("260707_co_structured_attempts.csv") as fh:
+      rows = list(csv.DictReader(fh))
+  k = int(rows[0]["path_row"])
+  sl = slice(npz["row_start"][k], npz["row_start"][k] + npz["row_len"][k])
+  x, y, t = npz["cursor_x"][sl], npz["cursor_y"][sl], npz["task_time_s"][sl]
+  ```
+
+Notes:
+- Pair adjacency (`pair_id`) is guaranteed only for data recorded with the pair-boundary executor build
+  (≥ 2026-07-07); in older recordings a random insert could land inside a pair, leaving those attempts unpaired.
+- The schedule advances per *presented* trial, not per success — filter on `outcome == "success"` (or
+  `pair_complete`) for completed reaches.
+- Attempts without a `schedule_phase` key (pure-Python task, pre-schedule days) are ignored; if the whole day
+  has none, the module prints a note and writes nothing.
 
 Cross-day plot example:
 

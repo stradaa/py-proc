@@ -419,8 +419,24 @@ def get_trial_segment(
     pre_s: float = 0.15,
     post_s: float = 0.25,
 ) -> TrialSegment:
-    alltrial = get_trial_row(dataset.all_trials, trial_index)
     attempt = _get_final_attempt(dataset.behav_results[trial_index])
+    return get_attempt_segment(dataset, trial_index, attempt, pre_s=pre_s, post_s=post_s)
+
+
+def get_attempt_segment(
+    dataset: JoystickDataset,
+    trial_index: int,
+    attempt: Dict[str, Any],
+    pre_s: float = 0.15,
+    post_s: float = 0.25,
+) -> TrialSegment:
+    """Cursor/joystick segment for one attempt of a trial.
+
+    The Rust task runs many attempts per Thalamus trial; get_trial_segment
+    only sees the final one. This accepts any attempt dict from
+    behav_result["attempts"].
+    """
+    alltrial = get_trial_row(dataset.all_trials, trial_index)
     events_task_s = extract_trial_event_times_task_s(dataset, alltrial)
 
     target_on_event = select_attempt_event(attempt, "target_on", "first")
