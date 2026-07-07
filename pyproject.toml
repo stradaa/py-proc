@@ -2,6 +2,7 @@
 name = "py_proc_alexrig"
 version = "0.0.1"
 dependencies = [
+    "av>=17.1.0",  # py_proc/video_remux: lossless camera MP4 remux with true PTS
 ]
 
 [build-system]

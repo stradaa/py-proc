@@ -9,6 +9,7 @@ import typing
 import struct
 import pickle
 import pathlib
+import tempfile
 import argparse
 import threading
 import traceback
@@ -24,6 +25,16 @@ import scipy.io
 
 from thalamus.thalamus_pb2 import StorageRecord, Image, Compressed
 import google.protobuf.message
+
+# Ensure the repo root (parent of the py_proc package) is importable when this
+# file is launched as a bare script (python py_proc/procThalamus_indie.py),
+# which is how run_day_pipeline.py invokes it — otherwise only py_proc/ is on
+# sys.path and `import py_proc...` fails.
+_REPO_ROOT = str(pathlib.Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from py_proc.video_remux import make_camera_video, PacketSpool
 
 # python procThalamus_indie.py -d 260324 --skip-video
 
@@ -591,6 +602,18 @@ def main():
     behave_result = []
 
     dims: typing.Dict[str, typing.List[typing.Tuple[int, int]]] = collections.defaultdict(lambda: [])
+
+    # --- Camera video reconstruction (timestamp-driven) ---
+    # Rebuild each camera's image.mp4 from the behave file's own MPEG4 frames so
+    # the video is 1:1 with the record.time timestamps (see py_proc/video_remux).
+    # Encoded frames are spooled to a temp file per node to bound RAM (Cam Top
+    # can exceed 1 GB per rec); video_times/video_dims stay 1:1 with the spool.
+    reconstruct_video = not args.skip_video
+    video_spool_dir = pathlib.Path(tempfile.mkdtemp(prefix='vidremux_')) if reconstruct_video else None
+    video_spools: typing.Dict[str, PacketSpool] = {}
+    video_times: typing.Dict[str, typing.List[int]] = collections.defaultdict(list)
+    video_dims: typing.Dict[str, typing.List[typing.Tuple[int, int]]] = collections.defaultdict(list)
+
     message_count = 0
     success_count = 0
     fg = 1
@@ -616,8 +639,11 @@ def main():
 
     HAND_NODE = 'Node 2'
 
-    # Single pass over the behave file - reads both behavioral and NIDAQ data
-    with RecordReader(rec, False, not args.skip_video) as record_reader:
+    # Single pass over the behave file - reads both behavioral and NIDAQ data.
+    # mux=False: we never let the homegrown reader write a (constant-fps) sidecar
+    # .avi; instead we capture the encoded camera packets below and rebuild each
+    # image.mp4 from record.time (see py_proc/video_remux).
+    with RecordReader(rec, False, False) as record_reader:
       timer = Timer(1)
       timer.add_callback(lambda: print(100*record_reader.progress()))
       time_range = int(1e100), int(-1e100)
@@ -658,6 +684,17 @@ def main():
           if record.node == 'Oculomatic':
             current = oculomatic[record.time]
             oculomatic[record.time] = current._replace(width=image.width, height=image.height)
+          elif reconstruct_video and image.width > 0 and len(image.data) > 0 and len(image.data[0]) > 0:
+            # Capture the encoded MPEG4 frame paired with its true record.time.
+            # The width<=0 / empty sentinel record (trailing per camera) is
+            # dropped here, keeping video_times 1:1 with the frames written.
+            spool = video_spools.get(record.node)
+            if spool is None:
+              spool = PacketSpool(str(video_spool_dir / f'{record.node}.spool'))
+              video_spools[record.node] = spool
+            spool.append(bytes(image.data[0]))
+            video_times[record.node].append(record.time)
+            video_dims[record.node].append((image.width, image.height))
 
         elif body == 'analog':
           analog = record.analog
@@ -925,34 +962,29 @@ def main():
         print(f'Video: {node} already complete, skipping')
         continue
 
-      # Look for pre-extracted MP4 files
-      # AlexRig naming: "rec{N}.{node}.mp4" or "{node}.mp4"
-      mp4_candidates = [
-        day_dir / f'rec{rec_int}.{node}.mp4',
-        day_dir / f'{node}.mp4',
-      ]
-      mp4_file = None
-      for candidate in mp4_candidates:
-        if candidate.exists():
-          mp4_file = candidate
-          break
-
-      times = numpy.array(image_times[node], dtype=numpy.uint64)
-
-      if mp4_file is not None:
+      # Rebuild image.mp4 from the behave file's own frames (timestamp-driven),
+      # 1:1 with the record.time timestamps. record.time is the only valid
+      # timing authority; the pre-extracted sidecars' container fps is wrong
+      # and their frames don't correspond 1:1 to the behave image records.
+      if reconstruct_video:
+        times = numpy.array(video_times[node], dtype=numpy.uint64)
+        frame_dims = numpy.array(video_dims[node], dtype=numpy.int64)
+        spool = video_spools.get(node)
+        if spool is None or spool.count == 0:
+          print(f'WARNING: no camera frames captured for {node} rec {rec_int}, skipping video')
+          continue
         image_path = img_dir / node / 'image.mp4'
         image_path.parent.mkdir(exist_ok=True, parents=True)
         image_path.unlink(missing_ok=True)
-        # Prefer a symlink to preserve the original file, but fall back to copy
-        # on Windows systems without symlink privileges.
-        try:
-          image_path.symlink_to(mp4_file.resolve())
-          print(f'Video: linked {mp4_file} -> {image_path}')
-        except OSError:
-          shutil.copyfile(str(mp4_file), str(image_path))
-          print(f'Video: copied {mp4_file} -> {image_path}')
+        n_written = make_camera_video(spool, video_times[node], video_dims[node], image_path)
+        assert n_written == len(times), \
+          f'{node}: wrote {n_written} frames but have {len(times)} timestamps'
+        print(f'Video: reconstructed {n_written} frames from record.time -> {image_path}')
       else:
-        print(f'WARNING: No MP4 file found for {node} rec {rec_int}')
+        # --skip-video: no MP4 produced; still emit the timestamp .mat as before.
+        times = numpy.array(image_times[node], dtype=numpy.uint64)
+        frame_dims = array_dims[node]
+        print(f'Video: skipped (--skip-video) for {node} rec {rec_int}')
 
       frame_ids = [node for t in times]
       formats = ['mono8; mpeg4 compressed' for t in times]
@@ -1007,7 +1039,7 @@ def main():
             yaml.dump(distortion_model, distortion_model_file)
           frame_id_ords = numpy.array([ord(c) for c in str(frame_id_path)])
           distortion_model_ords = numpy.array([ord(c) for c in str(distortion_model_path)])
-          camera_info_dims = array_dims[node]
+          camera_info_dims = frame_dims
           width = camera_info_dims[:, 0]
           height = camera_info_dims[:, 1]
 
@@ -1040,6 +1072,12 @@ def main():
             'message_count': 1
           })
           break
+
+    # Free the per-rec camera spool temp files.
+    if video_spool_dir is not None:
+      for spool in video_spools.values():
+        spool.unlink()
+      shutil.rmtree(video_spool_dir, ignore_errors=True)
 
     metadata = {
       'rosbag2_bagfile_information': {
