@@ -154,10 +154,14 @@ def _build_day_summary(
     path_efficiencies: List[float] = []
     successful_trials = 0
     included_trials = 0
+    control_modes: set[str] = set()
+    blend_values: set[float] = set()
 
     for rec in recs:
         rec_str = f"{int(rec):03d}"
         dataset = load_joystick_dataset(repo_root, day, rec_str)
+        control_modes.add(str(dataset.control_mode))
+        blend_values.add(round(float(dataset.position_velocity_blend), 4))
         n_trials = len(np.asarray(dataset.all_trials["Trial"]).ravel())
 
         for trial_index in range(n_trials):
@@ -216,9 +220,13 @@ def _build_day_summary(
             if np.isfinite(efficiency):
                 path_efficiencies.append(efficiency)
 
+    control_mode_label, blend_repr, mode_mixed = _summarize_modes(control_modes, blend_values)
     return {
         "day": day,
         "selected_recs": [int(rec) for rec in recs],
+        "control_mode": control_mode_label,
+        "position_velocity_blend": blend_repr,
+        "control_mode_mixed": int(mode_mixed),
         "n_included_trials": int(included_trials),
         "n_successful_trials": int(successful_trials),
         "n_trials_with_entry": int(len(first_entry_success_flags)),
@@ -232,10 +240,31 @@ def _build_day_summary(
     }
 
 
+def _summarize_modes(
+    control_modes: set[str], blend_values: set[float]
+) -> Tuple[str, float, bool]:
+    """Collapse the modes/blends seen across a day's recs into a label, a
+    representative blend value, and a 'mixed' flag for the transition marker."""
+    modes = sorted(m for m in control_modes if m)
+    mixed = len(modes) > 1 or len({b for b in blend_values}) > 1
+    if not modes:
+        return "unknown", float("nan"), False
+    if len(modes) == 1:
+        mode = modes[0]
+        if mode == "blend":
+            blend = float(np.mean(list(blend_values))) if blend_values else float("nan")
+            return f"blend {blend:.2f}", blend, mixed
+        return mode, (float(next(iter(blend_values))) if blend_values else 0.0), mixed
+    return "mixed(" + ",".join(modes) + ")", float("nan"), True
+
+
 def _write_summary_csv(rows: Sequence[Dict[str, Any]], out_path: Path) -> None:
     fieldnames = [
         "day",
         "selected_recs",
+        "control_mode",
+        "position_velocity_blend",
+        "control_mode_mixed",
         "n_included_trials",
         "n_successful_trials",
         "n_trials_with_entry",
@@ -289,6 +318,28 @@ def _merge_summary_rows(existing_rows: Sequence[Dict[str, Any]], new_rows: Seque
     return [merged[day] for day in sorted(merged)]
 
 
+def _draw_mode_transitions(ax, rows: Sequence[Dict[str, Any]]) -> bool:
+    """Mark where control_mode changes between consecutive (day-sorted) rows
+    with a vertical line + label, and shade any 'mixed' days. Trends stay pooled
+    (single line); the marker just flags where the control law changed so
+    boundary steps aren't misread as skill change. Returns True if any drawn."""
+    labels = [str(row.get("control_mode", "")) for row in rows]
+    drawn = False
+    for i, row in enumerate(rows):
+        if int(row.get("control_mode_mixed", 0)):
+            ax.axvspan(i - 0.5, i + 0.5, color="#999999", alpha=0.12, zorder=0)
+            drawn = True
+    for i in range(1, len(labels)):
+        if labels[i] != labels[i - 1]:
+            ax.axvline(i - 0.5, color="#c0392b", linestyle="--", linewidth=1.3, alpha=0.8, zorder=2)
+            ax.text(
+                i - 0.5, 0.98, f"→ {labels[i]}", transform=ax.get_xaxis_transform(),
+                rotation=90, va="top", ha="right", fontsize=8, color="#c0392b", alpha=0.9,
+            )
+            drawn = True
+    return drawn
+
+
 def _plot_cross_day_metrics(rows: Sequence[Dict[str, Any]], out_path: Path) -> None:
     days = [str(row["day"]) for row in rows]
     x = np.arange(len(days), dtype=float)
@@ -333,7 +384,7 @@ def _plot_cross_day_metrics(rows: Sequence[Dict[str, Any]], out_path: Path) -> N
 
     ax_path.plot(x, path_efficiency, marker="o", color="#e67e22", linewidth=2)
     ax_path.set_ylabel("Path / straight-line")
-    ax_path.set_title("Median path efficiency by day")
+    ax_path.set_title("Median path efficiency by day  (control-law sensitive)")
     ax_path.grid(alpha=0.2)
 
     ax_successful.bar(x, successful_trials, color="#4c78a8", alpha=0.85, width=0.7)
@@ -341,12 +392,24 @@ def _plot_cross_day_metrics(rows: Sequence[Dict[str, Any]], out_path: Path) -> N
     ax_successful.set_title("Successful trials by day")
     ax_successful.grid(axis="y", alpha=0.2)
 
+    any_transition = False
     for ax in [ax_duration, ax_rates, ax_path, ax_successful]:
         ax.set_xticks(x)
         ax.set_xticklabels(days, rotation=25, ha="right")
         ax.set_xlabel("Day")
+        any_transition = _draw_mode_transitions(ax, rows) or any_transition
 
-    fig.tight_layout()
+    if any_transition:
+        fig.text(
+            0.5, 0.005,
+            "Dashed line = cursor control-mode change; shaded = mixed-mode day. "
+            "Path efficiency (and other cursor-kinematic metrics) is control-law sensitive: "
+            "steps at a transition may reflect the control law, not skill.",
+            ha="center", va="bottom", fontsize=8, color="#555555",
+        )
+        fig.tight_layout(rect=(0, 0.03, 1, 1))
+    else:
+        fig.tight_layout()
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
 

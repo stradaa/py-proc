@@ -321,6 +321,12 @@ class ProcGuiWindow(QMainWindow):
         self.validation_sample_trials_edit.setPlaceholderText("1 2 4 or 90-130")
         validation_form.addRow("Sample Trials", self.validation_sample_trials_edit)
 
+        self.validation_control_mode_label = QLabel("—")
+        self.validation_control_mode_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        validation_form.addRow("Control Mode", self.validation_control_mode_label)
+
         validation_btn = QPushButton("Generate Validation Report")
         validation_btn.clicked.connect(self.generate_validation_report)
         validation_form.addRow("", validation_btn)
@@ -1414,6 +1420,12 @@ class ProcGuiWindow(QMainWindow):
         def _done(result: Any) -> None:
             self.refresh_output_browser()
             if isinstance(result, dict):
+                mode = str(result.get("control_mode", "—"))
+                blend = result.get("position_velocity_blend", None)
+                if mode == "blend" and blend is not None:
+                    self.validation_control_mode_label.setText(f"blend ({float(blend):.2f})")
+                else:
+                    self.validation_control_mode_label.setText(mode)
                 self._append_log(json_like(result))
 
         self._run_worker(

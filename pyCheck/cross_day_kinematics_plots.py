@@ -14,6 +14,11 @@ from typing import Any, Dict, Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 
+try:
+    from .cross_day_plots import _draw_mode_transitions
+except ImportError:  # pragma: no cover - script-mode fallback
+    from cross_day_plots import _draw_mode_transitions
+
 
 def _line(ax, x, values, color, label=None, marker="o"):
     values = np.asarray(values, dtype=float)
@@ -83,16 +88,28 @@ def plot_cross_day_kinematics(rows: Sequence[Dict[str, Any]], out_path: Path) ->
     ax_throughput.set_ylabel("Trials attempted / min")
     ax_throughput.set_title("Throughput")
 
+    any_transition = False
     for ax in (ax_decomp, ax_rtcv, ax_dir, ax_submv, ax_sparc, ax_var, ax_engage, ax_throughput):
         ax.set_xticks(x)
         ax.set_xticklabels(days, rotation=25, ha="right")
         ax.set_xlabel("Day")
         ax.grid(alpha=0.2)
+        any_transition = _draw_mode_transitions(ax, rows) or any_transition
 
     # (9) Direction-resolved success-rate heatmap
     _plot_direction_heatmap(ax_heat, rows, days)
 
-    fig.tight_layout()
+    if any_transition:
+        fig.text(
+            0.5, 0.005,
+            "Dashed line = cursor control-mode change; shaded = mixed-mode day. "
+            "Direction error, submovements, SPARC, and variability are control-law sensitive: "
+            "steps at a transition may reflect the control law, not skill.",
+            ha="center", va="bottom", fontsize=8, color="#555555",
+        )
+        fig.tight_layout(rect=(0, 0.025, 1, 1))
+    else:
+        fig.tight_layout()
     fig.savefig(out_path, dpi=170)
     plt.close(fig)
 

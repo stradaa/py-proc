@@ -555,6 +555,27 @@ def _filter_trial_rows(data: Dict[str, np.ndarray], keep: np.ndarray) -> Dict[st
     return filtered
 
 
+def _day_control_mode(repo_root: Path, day: str, recs: List[int]) -> Dict[str, object]:
+    """Control-mode provenance for the day: {control_mode, position_velocity_blend,
+    mixed} across the recs (from each rec's task_config). Non-fatal on load error."""
+    from pyCheck.joystick_validation import load_joystick_dataset
+
+    modes: set[str] = set()
+    blends: set[float] = set()
+    for rec in recs:
+        try:
+            ds = load_joystick_dataset(repo_root, day, f"{int(rec):03d}")
+        except Exception:  # noqa: BLE001 - a bad rec must not break provenance
+            continue
+        modes.add(str(ds.control_mode))
+        blends.add(round(float(ds.position_velocity_blend), 4))
+    return {
+        "modes": sorted(modes),
+        "position_velocity_blend": sorted(blends),
+        "mixed": bool(len(modes) > 1 or len(blends) > 1),
+    }
+
+
 def generate_day_presentation_plots(
     repo_root: str | Path,
     day: str,
@@ -653,6 +674,14 @@ def generate_day_presentation_plots(
     except Exception as exc:  # noqa: BLE001 - never let co_structured break the summary
         print(f"co_structured: failed ({exc}); continuing without it")
         metrics["co_structured"] = {"error": str(exc)}
+
+    # Cursor control-mode provenance for the day (from the first loadable rec's
+    # task_config). Guarded so it never breaks the summary.
+    try:
+        recs = sorted({int(r) for r in np.asarray(_flat(data, "Rec", int)).ravel().tolist()})
+        metrics["control_mode"] = _day_control_mode(repo_root_path, day, recs)
+    except Exception as exc:  # noqa: BLE001
+        print(f"control_mode provenance: skipped ({exc})")
 
     metrics_path = out_dir_path / f"{day}_summary_metrics.json"
     with open(metrics_path, "w", encoding="utf-8") as fh:

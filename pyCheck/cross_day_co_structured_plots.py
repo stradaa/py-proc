@@ -14,6 +14,11 @@ from typing import Any, Dict, Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 
+try:
+    from .cross_day_plots import _draw_mode_transitions
+except ImportError:  # pragma: no cover - script-mode fallback
+    from cross_day_plots import _draw_mode_transitions
+
 
 def _line(ax, x, values, color, label=None, marker="o"):
     values = np.asarray(values, dtype=float)
@@ -78,12 +83,17 @@ def plot_cross_day_co_structured(rows: Sequence[Dict[str, Any]], out_path: Path)
         ax.set_xticklabels(days, rotation=25, ha="right")
         ax.set_xlabel("Day")
         ax.grid(alpha=0.2)
+        _draw_mode_transitions(ax, rows)
 
     # (6) Direction-resolved success-rate heatmap
     _plot_direction_heatmap(ax_heat, rows, days)
 
-    fig.suptitle("Structured center-out (CO) learning across days")
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.suptitle(
+        "Structured center-out (CO) learning across days\n"
+        "dashed = control-mode change; path efficiency & trajectory shape are control-law sensitive",
+        fontsize=10,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(out_path, dpi=170)
     plt.close(fig)
 

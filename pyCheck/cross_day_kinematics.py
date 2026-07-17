@@ -40,14 +40,14 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 
 try:
-    from .cross_day_plots import _parse_day_rec_selection, _default_out_dir, _is_requested_task
+    from .cross_day_plots import _parse_day_rec_selection, _default_out_dir, _is_requested_task, _summarize_modes
     from .cross_day_kinematics_plots import plot_cross_day_kinematics
     from .joystick_validation import (
         _get_final_attempt, get_trial_row, load_joystick_dataset, select_attempt_event,
     )
     from . import kinematics_features as kf
 except ImportError:  # pragma: no cover - script-mode fallback
-    from cross_day_plots import _parse_day_rec_selection, _default_out_dir, _is_requested_task
+    from cross_day_plots import _parse_day_rec_selection, _default_out_dir, _is_requested_task, _summarize_modes
     from cross_day_kinematics_plots import plot_cross_day_kinematics
     from joystick_validation import (
         _get_final_attempt, get_trial_row, load_joystick_dataset, select_attempt_event,
@@ -57,7 +57,8 @@ except ImportError:  # pragma: no cover - script-mode fallback
 
 # Scalar metric columns (the direction heatmap lives only in the JSON).
 _KIN_FIELDS = [
-    "day", "selected_recs", "n_included_trials",
+    "day", "selected_recs", "control_mode", "position_velocity_blend", "control_mode_mixed",
+    "n_included_trials",
     "median_reaction_time_ms", "median_transport_time_ms",
     "median_acquisition_time_ms", "reaction_time_cv",
     "median_initial_direction_error_deg", "median_submovement_count",
@@ -101,6 +102,8 @@ def build_day_kinematics(
     rec_trial_counts: List[int] = []
     rec_spans_s: List[float] = []
     included = 0
+    control_modes: set[str] = set()
+    blend_values: set[float] = set()
 
     for rec in recs:
         rec_str = f"{int(rec):03d}"
@@ -109,6 +112,8 @@ def build_day_kinematics(
         except Exception as exc:  # noqa: BLE001
             print(f"  kinematics: could not load {day}/{rec_str} ({exc}); skipping")
             continue
+        control_modes.add(str(dataset.control_mode))
+        blend_values.add(round(float(dataset.position_velocity_blend), 4))
         n_trials = len(np.asarray(dataset.all_trials["Trial"]).ravel())
 
         rec_trials = 0
@@ -201,9 +206,13 @@ def build_day_kinematics(
                        float(np.median([p[1] for p in v]))]
               for k, v in xy_by_dir.items() if v}
 
+    control_mode_label, blend_repr, mode_mixed = _summarize_modes(control_modes, blend_values)
     return {
         "day": day,
         "selected_recs": [int(r) for r in recs],
+        "control_mode": control_mode_label,
+        "position_velocity_blend": blend_repr,
+        "control_mode_mixed": int(mode_mixed),
         "n_included_trials": int(included),
         "median_reaction_time_ms": 1e3 * _median(rt),
         "median_transport_time_ms": 1e3 * _median(transport),

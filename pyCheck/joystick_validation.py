@@ -17,6 +17,9 @@ import numpy as np
 import yaml
 from scipy.io import loadmat
 
+from pyjoystick.cursor import apply_direction_influence
+from pyjoystick.cursor import reconstruct_cursor as _reconstruct_cursor
+
 
 @dataclass
 class TrialSegment:
@@ -83,6 +86,8 @@ class JoystickDataset:
     all_trials: Dict[str, Any]
     behav_results: List[Dict[str, Any]]
     task_configs: List[Dict[str, Any]]
+    control_mode: str = "direct"
+    position_velocity_blend: float = 0.0
 
     def rec_ms_to_task_s(self, rec_ms: float) -> float:
         return ((rec_ms / 1e3) - self.w_offset_s) / self.w_slope
@@ -225,7 +230,13 @@ def load_joystick_dataset(repo_root: str | Path, day: str, rec: str = "001") -> 
     all_trials = _filter_all_trials_for_rec(all_trials_raw, int(rec))
 
     ref_cfg = task_configs[0]
-    cursor_x, cursor_y = reconstruct_cursor(joystick_x, joystick_y, joystick_task_s, ref_cfg)
+    control_mode, blend = _resolve_control_mode(task_configs, day, rec)
+    # Per-trial re-center points (task_perf_counter clock == joystick_task_s),
+    # so the stateful modes reset exactly where the task did.
+    trial_start_times_s = _extract_trial_start_times_s(behav_results)
+    cursor_x, cursor_y = reconstruct_cursor(
+        joystick_x, joystick_y, joystick_task_s, ref_cfg, trial_start_times_s
+    )
 
     return JoystickDataset(
         root=root,
@@ -242,7 +253,42 @@ def load_joystick_dataset(repo_root: str | Path, day: str, rec: str = "001") -> 
         all_trials=all_trials,
         behav_results=behav_results,
         task_configs=task_configs,
+        control_mode=control_mode,
+        position_velocity_blend=blend,
     )
+
+
+def _resolve_control_mode(
+    task_configs: List[Dict[str, Any]], day: str, rec: str
+) -> Tuple[str, float]:
+    """Rec-level control_mode + position_velocity_blend (from the first trial),
+    warning if they vary within the rec (reconstruction uses the first config)."""
+    modes = {str(c.get("control_mode", "direct")).lower() for c in task_configs if isinstance(c, dict)}
+    blends = {round(float(c.get("position_velocity_blend", 0.0)), 4) for c in task_configs if isinstance(c, dict)}
+    if len(modes) > 1 or len(blends) > 1:
+        print(
+            f"[joystick_validation] WARNING {day}/{rec}: control mode varies within rec "
+            f"(control_mode={sorted(modes)}, position_velocity_blend={sorted(blends)}); "
+            f"reconstruction uses the first trial's config. Split recs by mode for clean metrics."
+        )
+    ref = task_configs[0] if task_configs and isinstance(task_configs[0], dict) else {}
+    return str(ref.get("control_mode", "direct")).lower(), float(ref.get("position_velocity_blend", 0.0))
+
+
+def _extract_trial_start_times_s(behav_results: List[Dict[str, Any]]) -> List[float]:
+    """First ``target_on`` time (perf-counter clock) of every attempt, sorted.
+    These are the per-trial cursor re-center points honored by stateful modes."""
+    starts: List[float] = []
+    for result in behav_results:
+        if not isinstance(result, dict):
+            continue
+        for attempt in result.get("attempts", []):
+            if not isinstance(attempt, dict):
+                continue
+            ev = select_attempt_event(attempt, "target_on", "first")
+            if ev is not None and "time_perf_counter" in ev:
+                starts.append(float(ev["time_perf_counter"]))
+    return sorted(starts)
 
 
 def open_camera_readers(
@@ -371,54 +417,19 @@ def reconstruct_cursor(
     joystick_y: np.ndarray,
     task_time_s: np.ndarray,
     task_config: Dict[str, Any],
+    trial_start_times_s: Sequence[float] = (),
 ) -> Tuple[np.ndarray, np.ndarray]:
-    control_mode = str(task_config.get("control_mode", "direct")).lower()
-    jx, jy = apply_direction_influence(joystick_x, joystick_y, task_config)
+    """Reconstruct the normalized cursor from joystick (direct/cumulative/blend).
 
-    if control_mode == "direct":
-        direct_range = float(task_config.get("direct_range", 0.45))
-        cursor_x = 0.5 + jx * direct_range
-        cursor_y = 0.5 + jy * direct_range
-        return np.clip(cursor_x, 0.0, 1.0), np.clip(cursor_y, 0.0, 1.0)
-
-    cumulative_speed = float(task_config.get("cumulative_speed", 0.70))
-    zero_drift_mode = bool(task_config.get("zero_drift_mode", True))
-    zero_drift_buffer = float(task_config.get("zero_drift_buffer", 0.05))
-    cursor_x = np.empty_like(jx, dtype=float)
-    cursor_y = np.empty_like(jy, dtype=float)
-    cursor_x[0] = 0.5
-    cursor_y[0] = 0.5
-    dt = np.diff(task_time_s, prepend=task_time_s[0])
-
-    for i in range(1, len(jx)):
-        jx_i = float(jx[i])
-        jy_i = float(jy[i])
-        if zero_drift_mode and np.hypot(jx_i, jy_i) < zero_drift_buffer:
-            jx_i = 0.0
-            jy_i = 0.0
-        cursor_x[i] = np.clip(cursor_x[i - 1] + jx_i * cumulative_speed * dt[i], 0.0, 1.0)
-        cursor_y[i] = np.clip(cursor_y[i - 1] + jy_i * cumulative_speed * dt[i], 0.0, 1.0)
-
-    return cursor_x, cursor_y
-
-
-def apply_direction_influence(
-    joystick_x: np.ndarray,
-    joystick_y: np.ndarray,
-    task_config: Dict[str, Any],
-) -> Tuple[np.ndarray, np.ndarray]:
-    up = float(task_config.get("up_influence_pct", 100.0)) / 100.0
-    down = float(task_config.get("down_influence_pct", 100.0)) / 100.0
-    left = float(task_config.get("left_influence_pct", 100.0)) / 100.0
-    right = float(task_config.get("right_influence_pct", 100.0)) / 100.0
-
-    jx = np.asarray(joystick_x, dtype=float).copy()
-    jy = np.asarray(joystick_y, dtype=float).copy()
-    jx[jx > 0] *= right
-    jx[jx < 0] *= left
-    jy[jy > 0] *= up
-    jy[jy < 0] *= down
-    return jx, jy
+    Delegates to the shared canonical implementation so the metrics layer and
+    the replay overlay stay identical. ``trial_start_times_s`` (in the same
+    clock as ``task_time_s``) are the per-trial re-center points honored by the
+    stateful modes when ``reset_cursor_each_trial`` is set; pass none to keep the
+    legacy single-reset behavior.
+    """
+    return _reconstruct_cursor(
+        task_time_s, joystick_x, joystick_y, task_config, trial_start_times_s
+    )
 
 
 def get_trial_segment(
@@ -581,6 +592,8 @@ def validate_trial_alignment(dataset: JoystickDataset, trial_index: int) -> List
 
         row = {
             "trial": trial_index + 1,
+            "control_mode": dataset.control_mode,
+            "position_velocity_blend": float(dataset.position_velocity_blend),
             "field_name": field_name,
             "event_name": event_name,
             "which": which,
@@ -847,6 +860,8 @@ def build_validation_report(
         plot_trial_timeseries(segment, out_path / f"trial_{trial:03d}_timeseries.png")
 
     summary = summarize_validation_rows(rows)
+    summary["control_mode"] = dataset.control_mode
+    summary["position_velocity_blend"] = float(dataset.position_velocity_blend)
     best_shift = min(shift_rows, key=lambda r: r["cursor_error_median"])
     summary["best_constant_shift_ms_for_cursor"] = float(best_shift["shift_ms"])
     summary["best_shift_cursor_error_median"] = float(best_shift["cursor_error_median"])

@@ -33,17 +33,18 @@ import numpy as np
 try:
     from .co_structured import AttemptRecord, STRUCTURED_PHASES, _collect_rec, _tag_pairs
     from .cross_day_co_structured_plots import plot_cross_day_co_structured
-    from .cross_day_plots import _default_out_dir, _parse_day_rec_selection
+    from .cross_day_plots import _default_out_dir, _parse_day_rec_selection, _summarize_modes
     from .joystick_validation import load_joystick_dataset
 except ImportError:  # pragma: no cover - script-mode fallback
     from co_structured import AttemptRecord, STRUCTURED_PHASES, _collect_rec, _tag_pairs
     from cross_day_co_structured_plots import plot_cross_day_co_structured
-    from cross_day_plots import _default_out_dir, _parse_day_rec_selection
+    from cross_day_plots import _default_out_dir, _parse_day_rec_selection, _summarize_modes
     from joystick_validation import load_joystick_dataset
 
 # Scalar metric columns (the direction heatmap lives only in the JSON).
 _FIELDS = [
-    "day", "selected_recs", "n_structured_attempts", "n_random_attempts",
+    "day", "selected_recs", "control_mode", "position_velocity_blend", "control_mode_mixed",
+    "n_structured_attempts", "n_random_attempts",
     "n_peripheral_success", "structured_success_rate", "random_success_rate",
     "median_duration_s", "median_path_efficiency",
     "n_pairs", "n_complete_pairs", "pair_completion_rate",
@@ -65,6 +66,8 @@ def _success_rate(records: Sequence[AttemptRecord]) -> float:
 def build_day_co_structured(repo_root: Path, day: str, recs: Sequence[int]) -> Dict[str, Any]:
     records: List[AttemptRecord] = []
     next_pair_id = 0
+    control_modes: set[str] = set()
+    blend_values: set[float] = set()
     for rec in recs:
         rec_str = f"{int(rec):03d}"
         try:
@@ -72,6 +75,8 @@ def build_day_co_structured(repo_root: Path, day: str, recs: Sequence[int]) -> D
         except Exception as exc:  # noqa: BLE001 - a bad rec must not kill the day
             print(f"  cross_day_co_structured: could not load {day}/{rec_str} ({exc}); skipping")
             continue
+        control_modes.add(str(dataset.control_mode))
+        blend_values.add(round(float(dataset.position_velocity_blend), 4))
         rec_records = _collect_rec(dataset, day, int(rec))
         next_pair_id = _tag_pairs(rec_records, next_pair_id)
         records.extend(rec_records)
@@ -99,9 +104,13 @@ def build_day_co_structured(repo_root: Path, day: str, recs: Sequence[int]) -> D
         dir_success[str(angle)] = _success_rate(group)
         dir_n[str(angle)] = len(group)
 
+    control_mode_label, blend_repr, mode_mixed = _summarize_modes(control_modes, blend_values)
     return {
         "day": day,
         "selected_recs": [int(r) for r in recs],
+        "control_mode": control_mode_label,
+        "position_velocity_blend": blend_repr,
+        "control_mode_mixed": int(mode_mixed),
         "n_structured_attempts": len(structured),
         "n_random_attempts": len(random_inserts),
         "n_peripheral_success": len(peripheral_success),
