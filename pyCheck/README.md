@@ -23,10 +23,11 @@ Tools in this folder:
   already in `AllTrials.mat`: `*_kinematic_intervals.png` (reaction / movement / hold-duration histograms),
   `*_failure_modes.png` (why failed trials failed, per rec), `*_overshoot_attempts.png` (target re-entry rate and
   attempts per trial), and `*_engagement.png` (inter-trial interval, cumulative trials vs rewards, trial rate per rec).
-- `co_structured.py`
+- `co_structured.py` / `co_structured_plots.py`
   Structured center-out (CO) outputs for days recorded with the Rust executor's target schedule: separates
   `schedule_phase`-tagged attempts (`center` / `peripheral` / `sequence` vs `random` inserts), writes
-  `*_co_structured.png` (reach paths + performance bars), `*_co_structured_attempts.csv` (one row per attempt),
+  `*_co_structured.png` (per-target compass trajectory grid), `*_co_structured_metrics.png` (performance /
+  speed / path-efficiency bars by direction), `*_co_structured_attempts.csv` (one row per attempt),
   and `*_co_structured_paths.npz` (full cursor/joystick paths). Runs automatically inside
   `generate_day_presentation_plots` (skipped when a day has no `schedule_phase` data) or standalone via
   `python -m pyCheck.co_structured` with the same `--repo-root/--day/--day-dir/--out-dir/--exclude-recs` args.
@@ -150,8 +151,9 @@ Inside that folder it writes:
 - `260331_overshoot_attempts.png` — target re-entry rate per rec and attempts-per-trial distribution
 - `260331_engagement.png` — inter-trial interval, cumulative trials vs rewards, and trial rate per rec
 - `260331_summary_metrics.json`
-- `260331_co_structured.png` / `_co_structured_attempts.csv` / `_co_structured_paths.npz` — only for days whose
-  attempts carry `schedule_phase` (Rust executor target schedule); see "Structured center-out outputs" below
+- `260331_co_structured.png` / `_co_structured_metrics.png` / `_co_structured_attempts.csv` /
+  `_co_structured_paths.npz` — only for days whose attempts carry `schedule_phase` (Rust executor target
+  schedule); see "Structured center-out outputs" below
 
 Notes:
 - `--out-dir` is optional; if provided, it overrides the default `claude/figures/<day>/beh` path.
@@ -210,13 +212,28 @@ picks). It reads attempts straight from `recNNN.ev.mat` `behav_results` — no p
 schema change — and reconstructs each attempt's cursor path from `joystick.mat`.
 
 Outputs (same `claude/figures/<day>/beh` folder):
-- **`<day>_co_structured.png`** — four panels: structured peripheral reaches colored per target, center
-  (return) reaches, random-insert reaches in gray, and success-rate bars (per peripheral target, structured
-  vs random overall, and center→peripheral pair completion).
+- **`<day>_co_structured.png`** — a 3x3 compass grid, one panel per peripheral CO target laid out by true
+  direction (e.g. the 90° target's panel is top-middle, 0° is middle-right), each showing every successful
+  reach to that target (thin, translucent) plus one bold average trajectory (per-trial cursor paths resampled
+  onto a common normalized-time grid and averaged). Reaches end right at target acquisition — the return leg
+  is a separate `center`-phase attempt and isn't drawn here. The center grid cell overlays all 8 average
+  trajectories for a quick direction comparison.
+- **`<day>_co_structured_metrics.png`** — three bar-chart panels, x-axis ordered by angle (0°→315°):
+  (1) success rate per peripheral target / structured vs random overall / center→peripheral pair completion,
+  (2) median reach duration by direction (successful attempts only), and (3) median path efficiency by
+  direction (successful attempts only; actual path length / straight-line distance from `target_on` to
+  `hold_complete`, with a dashed reference line at 1.0 = perfectly straight — values can occasionally dip
+  below 1.0 when a reach undershoots into the near edge of a wide target, since the ratio is measured against
+  the nominal target center rather than the actual stop point).
 - **`<day>_co_structured_attempts.csv`** — one row per `schedule_phase` attempt:
   `day, rec, trial_index, attempt_index, schedule_phase, outcome, failure_reason, target_index, target_name,
-  target_x, target_y, target_radius, t_target_on, t_end, duration_s, pair_id, pair_complete, path_row`.
-  `pair_id >= 0` groups an adjacent center→peripheral pair; `path_row` indexes into the NPZ (−1 = no path).
+  target_x, target_y, target_radius, target_angle_deg, t_target_on, t_end, t_hold_complete, duration_s,
+  path_efficiency, pair_id, pair_complete, path_row`.
+  `target_angle_deg` is the target's true angle from center (0.5, 0.5) in degrees [0, 360), derived
+  geometrically (never from `target_name`, which is an arbitrary experimenter string) — populated only for
+  `schedule_phase == "peripheral"` (NaN otherwise). `path_efficiency` is populated only for successful
+  peripheral attempts. `pair_id >= 0` groups an adjacent center→peripheral pair; `path_row` indexes into the
+  NPZ (−1 = no path).
 - **`<day>_co_structured_paths.npz`** — pickle-free ragged path storage: concatenated `task_time_s`,
   `cursor_x`, `cursor_y`, `joystick_x`, `joystick_y` plus `row_start` / `row_len`. Reconstruct row `k` with
   `sl = slice(row_start[k], row_start[k] + row_len[k])`, e.g.:
@@ -265,6 +282,7 @@ Cross-day selection notes:
 - Cross-day outputs now include `cross_day_metrics.png`, `cross_day_summary_metrics.json`, and `cross_day_summary_metrics.csv`.
 - A companion **`cross_day_kinematics.png`** (plus `cross_day_kinematics_metrics.json` / `.csv`) is written alongside the headline figure by `cross_day_kinematics.py`. It adds finer-grained motor-learning metrics — movement-time decomposition (reaction / transport / acquisition), reaction-time variability, initial reach-direction error, submovement count, SPARC smoothness, trajectory & endpoint variability, engagement (attempts/trial, idle rate, trials/min), and a direction-resolved success-rate heatmap. All are computed on the task/behave clock (event `time_perf_counter` + reconstructed cursor), like the existing cross-day metrics. Run it standalone with the same `--day-recs` / `--task-types` args as `cross_day_plots.py`, or get it automatically from `generate_cross_day_plots` (the GUI's cross-day button).
   - Note: in direct control mode `first_joystick_movement` fires almost immediately after `target_on`, so the "reaction" component is near-zero and the **transport time (move→entry) is the meaningful reach-speed metric**.
+- A second companion **`cross_day_co_structured.png`** (plus `cross_day_co_structured_metrics.json` / `.csv`) is written alongside the headline figure by `cross_day_co_structured.py`, on days that carry `schedule_phase`-tagged attempts (see "Structured center-out outputs" above). It tracks structured-CO learning specifically: structured-vs-random success rate, median reach duration and path efficiency by day (successful peripheral reaches only), center→peripheral pair completion rate, attempt counts by day, and a direction-resolved success-rate heatmap (day x angle) that shows whether directional bias shrinks over days. Aggregation reuses `co_structured.py`'s own attempt collection directly against each day's raw data, so it doesn't depend on that day's per-day `co_structured` figures having been generated first. Run it standalone with the same `--day-recs` args as `cross_day_plots.py`, or get it automatically from `generate_cross_day_plots`. Skips cleanly (prints a note, no figure) on days/selections with no `schedule_phase` data.
 - The duration metric is computed on successful trials as `hold_complete - target_on`.
 - Hold-break rate is computed among trials that reached first target entry.
 - First-entry success means the first target entry reached hold completion before any exit or hold break.

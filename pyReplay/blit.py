@@ -30,6 +30,25 @@ class BlitManager:
         art.set_animated(True)
         self._artists.append(art)
 
+    def invalidate(self):
+        """Drop the cached background so the next draw re-captures it.
+
+        Needed when the canvas is re-sized or re-parented (e.g. an embedded
+        player swapped in on a consecutive load): the old background belongs to
+        the previous geometry and would blit garbage if reused."""
+        self._bg = None
+
+    def disconnect(self):
+        """Detach from the canvas so the manager can be torn down cleanly."""
+        if self._cid is not None:
+            try:
+                self.canvas.mpl_disconnect(self._cid)
+            except Exception:
+                pass
+            self._cid = None
+        self._bg = None
+        self._artists = []
+
     def _draw_animated(self):
         fig = self.canvas.figure
         for art in self._artists:

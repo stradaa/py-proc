@@ -6,8 +6,12 @@ with ``schedule_phase``: ``"center"`` / ``"peripheral"`` (center-out mode),
 insert, or a fallback pick). This module separates structured trials from
 random inserts and writes, per day:
 
-- ``<day>_co_structured.png`` — reach paths for structured peripheral /
-  center / random-insert attempts plus success-rate bars.
+- ``<day>_co_structured.png`` — a 3x3 compass grid, one panel per peripheral
+  CO target laid out by true direction, showing successful reach trajectories
+  and their average; the center cell overlays all 8 average trajectories.
+- ``<day>_co_structured_metrics.png`` — success-rate bars (per peripheral
+  target, structured vs random, pair completion), plus median reach duration
+  and path efficiency by direction.
 - ``<day>_co_structured_attempts.csv`` — one row per attempt that carries a
   ``schedule_phase`` (rec, trial, attempt, phase, outcome, target identity,
   timing, pair tagging, and the row's slice into the NPZ).
@@ -34,18 +38,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 
+from pyCheck.cross_day_plots import _compute_path_efficiency
 from pyCheck.joystick_validation import (
     JoystickDataset,
     get_attempt_segment,
     load_joystick_dataset,
     select_attempt_event,
 )
-from pyCheck.plot_utils import _save_figure, _title_suffix
 
 STRUCTURED_PHASES = ("center", "peripheral", "sequence")
 
@@ -78,6 +79,9 @@ class AttemptRecord:
     pair_id: int = -1
     pair_complete: bool = False
     path_row: int = -1
+    target_angle_deg: float = np.nan
+    t_hold_complete: float = np.nan
+    path_efficiency: float = np.nan
     path: Optional[Dict[str, np.ndarray]] = field(default=None, repr=False)
 
 
@@ -108,13 +112,22 @@ def _target_name(dataset: JoystickDataset, trial_index: int, target_index: int) 
     return str(target.get("name", "")) if isinstance(target, dict) else ""
 
 
+def _target_angle_deg(target_x: float, target_y: float) -> float:
+    """Angle of the target from the task center (0.5, 0.5), degrees normalized to [0, 360)."""
+    if not (np.isfinite(target_x) and np.isfinite(target_y)):
+        return float(np.nan)
+    return float(np.degrees(np.arctan2(target_y - 0.5, target_x - 0.5)) % 360.0)
+
+
 def _attempt_times(attempt: Dict[str, Any]) -> tuple:
     target_on = select_attempt_event(attempt, "target_on", "first")
     end_name = "success" if str(attempt.get("outcome", "")).lower() == "success" else "fail"
     end_event = select_attempt_event(attempt, end_name, "last")
+    hold_complete = select_attempt_event(attempt, "hold_complete", "first")
     t_on = float(target_on["time_perf_counter"]) if target_on is not None else np.nan
     t_end = float(end_event["time_perf_counter"]) if end_event is not None else np.nan
-    return t_on, t_end
+    t_hold_complete = float(hold_complete["time_perf_counter"]) if hold_complete is not None else np.nan
+    return t_on, t_end, t_hold_complete
 
 
 def _collect_rec(dataset: JoystickDataset, day: str, rec: int) -> List[AttemptRecord]:
@@ -133,7 +146,9 @@ def _collect_rec(dataset: JoystickDataset, day: str, rec: int) -> List[AttemptRe
             target_position = attempt.get("target_position") or {}
             raw_idx = attempt.get("target_index")
             target_index = int(raw_idx) if raw_idx is not None else -1
-            t_on, t_end = _attempt_times(attempt)
+            t_on, t_end, t_hold_complete = _attempt_times(attempt)
+            target_x = float(target_position.get("x_norm", np.nan))
+            target_y = float(target_position.get("y_norm", np.nan))
             record = AttemptRecord(
                 day=day,
                 rec=rec,
@@ -144,13 +159,16 @@ def _collect_rec(dataset: JoystickDataset, day: str, rec: int) -> List[AttemptRe
                 failure_reason=str(attempt.get("failure_reason") or ""),
                 target_index=target_index,
                 target_name=_target_name(dataset, trial_index, target_index),
-                target_x=float(target_position.get("x_norm", np.nan)),
-                target_y=float(target_position.get("y_norm", np.nan)),
+                target_x=target_x,
+                target_y=target_y,
                 target_radius=float(attempt.get("target_radius_ratio") or np.nan),
                 t_target_on=t_on,
                 t_end=t_end,
+                t_hold_complete=t_hold_complete,
                 duration_s=float(attempt.get("duration_s") or np.nan),
             )
+            if phase == "peripheral":
+                record.target_angle_deg = _target_angle_deg(target_x, target_y)
             try:
                 segment = get_attempt_segment(dataset, trial_index, attempt)
                 record.path = {
@@ -162,6 +180,15 @@ def _collect_rec(dataset: JoystickDataset, day: str, rec: int) -> List[AttemptRe
                 }
             except (ValueError, KeyError):
                 record.path = None
+            if (
+                phase == "peripheral"
+                and record.outcome == "success"
+                and np.isfinite(t_on)
+                and np.isfinite(t_hold_complete)
+            ):
+                record.path_efficiency = _compute_path_efficiency(
+                    dataset, t_on, t_hold_complete, target_x, target_y
+                )
             trial_records.append(record)
         records.extend(trial_records)
     return records
@@ -187,8 +214,8 @@ def _write_csv(records: List[AttemptRecord], out_path: Path) -> None:
     columns = [
         "day", "rec", "trial_index", "attempt_index", "schedule_phase",
         "outcome", "failure_reason", "target_index", "target_name",
-        "target_x", "target_y", "target_radius",
-        "t_target_on", "t_end", "duration_s",
+        "target_x", "target_y", "target_radius", "target_angle_deg",
+        "t_target_on", "t_end", "t_hold_complete", "duration_s", "path_efficiency",
         "pair_id", "pair_complete", "path_row",
     ]
     with open(out_path, "w", newline="", encoding="utf-8") as fh:
@@ -199,8 +226,9 @@ def _write_csv(records: List[AttemptRecord], out_path: Path) -> None:
                 record.day, record.rec, record.trial_index, record.attempt_index,
                 record.schedule_phase, record.outcome, record.failure_reason,
                 record.target_index, record.target_name,
-                record.target_x, record.target_y, record.target_radius,
-                record.t_target_on, record.t_end, record.duration_s,
+                record.target_x, record.target_y, record.target_radius, record.target_angle_deg,
+                record.t_target_on, record.t_end, record.t_hold_complete, record.duration_s,
+                record.path_efficiency,
                 record.pair_id, int(record.pair_complete), record.path_row,
             ])
     print(f"Saved attempt table: {out_path}")
@@ -236,157 +264,6 @@ def _write_npz(records: List[AttemptRecord], out_path: Path) -> None:
         **arrays,
     )
     print(f"Saved reach paths: {out_path} ({row} paths, {cursor} samples)")
-
-
-def _success_rate(records: List[AttemptRecord]) -> float:
-    if not records:
-        return np.nan
-    return float(np.mean([r.outcome == "success" for r in records]))
-
-
-def _draw_targets(ax, records: List[AttemptRecord], edge_color: str = "#444444") -> None:
-    seen = set()
-    for record in records:
-        key = (round(record.target_x, 4), round(record.target_y, 4))
-        if key in seen or not np.isfinite(record.target_x):
-            continue
-        seen.add(key)
-        radius = record.target_radius if np.isfinite(record.target_radius) else 0.03
-        ax.add_patch(plt.Circle(
-            (record.target_x, record.target_y), radius,
-            fill=False, edgecolor=edge_color, linewidth=1.0, alpha=0.8,
-        ))
-
-
-def _draw_paths(ax, records: List[AttemptRecord], color_of) -> None:
-    for record in records:
-        if record.path is None:
-            continue
-        success = record.outcome == "success"
-        ax.plot(
-            record.path["cursor_x"], record.path["cursor_y"],
-            color=color_of(record),
-            linewidth=1.2 if success else 0.7,
-            alpha=0.75 if success else 0.30,
-            linestyle="-" if success else "--",
-        )
-
-
-def _setup_reach_axis(ax, title: str) -> None:
-    ax.set_xlim(0.0, 1.0)
-    ax.set_ylim(0.0, 1.0)
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_title(title, fontsize=10)
-    ax.grid(True, alpha=0.15)
-
-
-def _plot_figure(
-    records: List[AttemptRecord],
-    out_path: Path,
-    day: str,
-    exclude_recs: List[int],
-) -> Dict[str, object]:
-    peripheral = [r for r in records if r.schedule_phase == "peripheral"]
-    center = [r for r in records if r.schedule_phase == "center"]
-    sequence = [r for r in records if r.schedule_phase == "sequence"]
-    structured = peripheral + center + sequence
-    random_inserts = [r for r in records if r.schedule_phase == "random"]
-    pairs = {r.pair_id for r in records if r.pair_id >= 0}
-    complete_pairs = {r.pair_id for r in records if r.pair_id >= 0 and r.pair_complete}
-
-    target_names = sorted({r.target_name or f"target {r.target_index}" for r in peripheral})
-    target_color = {
-        name: TARGET_PALETTE[i % len(TARGET_PALETTE)]
-        for i, name in enumerate(target_names)
-    }
-
-    def peripheral_color(record: AttemptRecord) -> str:
-        return target_color[record.target_name or f"target {record.target_index}"]
-
-    fig, axes = plt.subplots(2, 2, figsize=(12, 11))
-    ax_a, ax_b, ax_c, ax_d = axes.ravel()
-
-    _draw_paths(ax_a, peripheral, peripheral_color)
-    _draw_targets(ax_a, peripheral)
-    if center:
-        ax_a.scatter(
-            [center[0].target_x], [center[0].target_y],
-            marker="+", color="#222222", s=70, zorder=5,
-        )
-    _setup_reach_axis(ax_a, f"Structured peripheral reaches (n={len(peripheral)})")
-    for name in target_names:
-        ax_a.plot([], [], color=target_color[name], label=name)
-    if target_names:
-        ax_a.legend(loc="upper right", fontsize=7)
-
-    _draw_paths(ax_b, center, lambda r: CENTER_COLOR)
-    _draw_targets(ax_b, center)
-    _setup_reach_axis(ax_b, f"Center (return) reaches (n={len(center)})")
-
-    _draw_paths(ax_c, random_inserts, lambda r: RANDOM_COLOR)
-    _draw_targets(ax_c, random_inserts, edge_color="#999999")
-    _setup_reach_axis(ax_c, f"Random-insert reaches (n={len(random_inserts)})")
-
-    labels: List[str] = []
-    values: List[float] = []
-    counts: List[int] = []
-    colors: List[str] = []
-    for name in target_names:
-        group = [r for r in peripheral if (r.target_name or f"target {r.target_index}") == name]
-        labels.append(name)
-        values.append(_success_rate(group))
-        counts.append(len(group))
-        colors.append(target_color[name])
-    for label, group, color in (
-        ("structured", structured, "#333333"),
-        ("random", random_inserts, RANDOM_COLOR),
-    ):
-        labels.append(label)
-        values.append(_success_rate(group))
-        counts.append(len(group))
-        colors.append(color)
-    labels.append("pairs complete")
-    values.append(len(complete_pairs) / len(pairs) if pairs else np.nan)
-    counts.append(len(pairs))
-    colors.append("#54a24b")
-
-    x = np.arange(len(labels))
-    ax_d.bar(x, values, color=colors, alpha=0.85)
-    for xi, value, count in zip(x, values, counts):
-        if np.isfinite(value):
-            ax_d.text(xi, value + 0.02, f"{value:.0%}\nn={count}",
-                      ha="center", va="bottom", fontsize=7)
-    ax_d.set_xticks(x)
-    ax_d.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
-    ax_d.set_ylim(0.0, 1.15)
-    ax_d.set_ylabel("success rate")
-    ax_d.set_title("Performance: per target / structured vs random / pairs", fontsize=10)
-    ax_d.grid(True, axis="y", alpha=0.15)
-
-    fig.suptitle(f"{day} structured center-out summary{_title_suffix(exclude_recs)}")
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
-    _save_figure(fig, out_path, "co_structured")
-
-    per_target = {
-        name: {
-            "n": counts[i],
-            "success_rate": values[i] if np.isfinite(values[i]) else None,
-        }
-        for i, name in enumerate(target_names)
-    }
-    return {
-        "n_attempts": len(records),
-        "n_by_phase": {
-            phase: sum(1 for r in records if r.schedule_phase == phase)
-            for phase in ("center", "peripheral", "sequence", "random")
-        },
-        "structured_success_rate": _success_rate(structured) if structured else None,
-        "random_success_rate": _success_rate(random_inserts) if random_inserts else None,
-        "per_peripheral_target": per_target,
-        "n_pairs": len(pairs),
-        "n_complete_pairs": len(complete_pairs),
-        "pair_completion_rate": (len(complete_pairs) / len(pairs)) if pairs else None,
-    }
 
 
 def generate_co_structured_outputs(
@@ -432,7 +309,18 @@ def generate_co_structured_outputs(
     out_dir_path.mkdir(parents=True, exist_ok=True)
     _write_npz(records, out_dir_path / f"{day}_co_structured_paths.npz")
     _write_csv(records, out_dir_path / f"{day}_co_structured_attempts.csv")
-    metrics = _plot_figure(
+
+    # Local import: co_structured_plots imports AttemptRecord/palette constants
+    # back from this module, so a top-level import here would be circular.
+    from pyCheck.co_structured_plots import (
+        plot_co_structured_metrics,
+        plot_co_structured_trajectories,
+    )
+
+    metrics = plot_co_structured_metrics(
+        records, out_dir_path / f"{day}_co_structured_metrics.png", day, exclude_recs
+    )
+    metrics["trajectories"] = plot_co_structured_trajectories(
         records, out_dir_path / f"{day}_co_structured.png", day, exclude_recs
     )
     metrics["recs_used"] = recs_used

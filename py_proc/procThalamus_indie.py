@@ -35,6 +35,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from py_proc.video_remux import make_camera_video, PacketSpool
+from pyReplay.adjust import resolve as resolve_camera_adjust
 
 # python procThalamus_indie.py -d 260324 --skip-video
 
@@ -976,7 +977,14 @@ def main():
         image_path = img_dir / node / 'image.mp4'
         image_path.parent.mkdir(exist_ok=True, parents=True)
         image_path.unlink(missing_ok=True)
-        n_written = make_camera_video(spool, video_times[node], video_dims[node], image_path)
+        # Per-camera brightness/contrast/gamma correction (identity cameras stay a
+        # bit-exact lossless remux; dim ones are decoded, corrected, re-encoded).
+        adj = resolve_camera_adjust(node)
+        n_written = make_camera_video(spool, video_times[node], video_dims[node],
+                                      image_path, adjust=adj)
+        if not adj.is_identity:
+          print(f'Video: applying {node} correction '
+                f'(gain={adj.gain}, bias={adj.bias}, gamma={adj.gamma})')
         assert n_written == len(times), \
           f'{node}: wrote {n_written} frames but have {len(times)} timestamps'
         print(f'Video: reconstructed {n_written} frames from record.time -> {image_path}')

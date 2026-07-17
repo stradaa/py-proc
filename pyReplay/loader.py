@@ -43,6 +43,15 @@ ANALOG_CHANNELS = {
     "Dev1/ai2": "reward",
 }
 
+# Largest plausible recording length. Some behave files interleave records from
+# spurious nodes (e.g. 'Node 2' / 'Node 3') that carry an unrelated clock whose
+# timestamps are ~1e17 ns — thousands of years off. Such a value must never be
+# trusted as a real behave-clock time: it would corrupt t0 and, because the scan
+# breaks once record.time passes the window stop, an early glitch would end the
+# read before the requested window is ever reached (empty window). Any time more
+# than this far from t0 is treated as a clock glitch and skipped.
+_MAX_REC_NS = 24 * 3600 * 1_000_000_000  # 24 h in ns
+
 # Colors for known behavioral state / event labels (loose match to pyCheck).
 _EVENT_COLORS = {
     "success": "#2ca02c",
@@ -146,6 +155,61 @@ def _summary_targets(doc: dict):
 _OUTCOME_COLOR = {"success": "#4caf50", "fail": "#d62728", "failure": "#d62728"}
 
 
+def probe_cameras(behave_path: str, span_s: float = 3.0) -> Dict[str, tuple]:
+    """Cheaply measure each camera's native size and frame rate.
+
+    Scans only the first `span_s` of the file with decode_video=False (no frame
+    decoding — the image records still carry width/height), so it returns in a
+    fraction of a second. Returns {node: (native_w, native_h, fps)} for every
+    camera seen. Used to estimate the RAM a full load would hold before paying
+    for it. The clock-glitch guard from load_window applies here too.
+    """
+    import collections as _c
+
+    from thalamus.record_reader2 import RecordReader
+
+    t0_ns: Optional[int] = None
+    stop_ns = 0
+    dims: Dict[str, tuple] = {}
+    counts: "_c.Counter" = _c.Counter()
+    with RecordReader(behave_path, decode_video=False) as reader:
+        for record in reader:
+            t = record.time
+            if t:
+                if t0_ns is None:
+                    t0_ns = t
+                    stop_ns = int(t0_ns + span_s * 1e9)
+                elif abs(t - t0_ns) > _MAX_REC_NS:
+                    continue
+                if t > stop_ns:
+                    break
+            if record.WhichOneof("body") == "image":
+                im = record.image
+                if im.width > 0 and im.height > 0:
+                    dims[record.node] = (int(im.width), int(im.height))
+                    counts[record.node] += 1
+    span = max(span_s, 1e-9)
+    return {n: (w, h, counts[n] / span) for n, (w, h) in dims.items()}
+
+
+def estimate_frame_bytes(native_w: int, native_h: int, fps: float,
+                         window_s: float, target_h: int,
+                         max_fps: Optional[float] = None) -> int:
+    """Bytes one camera's frames will occupy for a load (grayscale uint8).
+
+    Mirrors frame_from_image's downscale (height capped at target_h, width
+    scaled to match) and load_window's fps decimation.
+    """
+    if native_h > target_h:
+        scale = target_h / native_h
+        w = max(1, round(native_w * scale))
+        h = target_h
+    else:
+        w, h = native_w, native_h
+    kept_fps = min(fps, max_fps) if (max_fps and max_fps > 0) else fps
+    return int(w * h * kept_fps * max(window_s, 0.0))
+
+
 def load_window(
     behave_path: str,
     start_s: float,
@@ -153,6 +217,7 @@ def load_window(
     *,
     camera_names: Optional[Sequence[str]] = None,
     target_h: int = 360,
+    max_fps: Optional[float] = None,
     progress: Optional[Callable[[float], None]] = None,
 ) -> ReplayWindow:
     """Preload the [start_s, stop_s] window of `behave_path` into a ReplayWindow.
@@ -162,7 +227,16 @@ def load_window(
 
     Frames are decoded straight from the behave file (decode_video=True) so each
     one is paired with its own record.time; no .avi sidecars or framerates.
+
+    target_h caps the retained frame height (frames are downsized to it), and
+    max_fps caps the retained per-camera frame rate — frames closer together
+    than 1/max_fps than the previous kept frame for that camera are dropped.
+    Both bound the RAM held for the whole window (every kept frame stays resident
+    for smooth playback); playback and MP4 export both display at 30 fps, so a
+    max_fps of ~30 is visually lossless while cutting high-fps cameras several-
+    fold. max_fps=None keeps every frame (original behaviour).
     """
+    min_gap_ns = int(1e9 / max_fps) if max_fps and max_fps > 0 else 0
     cam_frames: Dict[str, List[np.ndarray]] = collections.defaultdict(list)
     cam_times: Dict[str, List[int]] = collections.defaultdict(list)
 
@@ -189,6 +263,12 @@ def load_window(
                     t0_ns = t
                     start_ns = int(t0_ns + start_s * 1e9)
                     stop_ns = int(t0_ns + stop_s * 1e9)
+                elif abs(t - t0_ns) > _MAX_REC_NS:
+                    # Clock-glitch timestamp from a spurious node: don't trust it
+                    # for the window test or the early break, and don't collect
+                    # it. Skipping keeps the time-ordered scan alive so the real
+                    # window is still reached.
+                    continue
                 if t > stop_ns:
                     break
             if progress is not None and stop_ns:
@@ -203,6 +283,9 @@ def load_window(
                 node = record.node
                 if t0_ns is not None and start_ns <= t <= stop_ns:
                     if camera_names is None or node in camera_names:
+                        prev = cam_times[node]
+                        if min_gap_ns and prev and (t - prev[-1]) < min_gap_ns:
+                            continue  # decimate: too close to the last kept frame
                         frame = frame_from_image(record.image, target_h)
                         if frame is not None:
                             cam_frames[node].append(frame)

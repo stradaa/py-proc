@@ -252,7 +252,8 @@ def open_camera_readers(
     import cv2
 
     day_dir = dataset.root / dataset.day
-    bag_mat = day_dir / dataset.rec / f"rec{dataset.rec}.bag" / "mat"
+    bag = day_dir / dataset.rec / f"rec{dataset.rec}.bag"
+    bag_mat = bag / "mat"
     rec_int = int(dataset.rec)
     readers: Dict[str, CameraReader] = {}
     for cam in camera_names:
@@ -262,13 +263,20 @@ def open_camera_readers(
             continue
         m = loadmat(str(mat_path), simplify_cells=True)
         timestamps_ns = np.asarray(m["topic_time_stamp"], dtype=np.uint64).ravel()
-        avi_path = day_dir / f"behave.20{dataset.day}.{rec_int}.{cam}.avi"
-        if not avi_path.exists():
-            print(f"Camera video not found: {avi_path}")
-            continue
-        cap = cv2.VideoCapture(str(avi_path))
+        # Prefer the per-rec image.mp4 rebuilt from record.time (1:1 with the mat
+        # timestamps, so CameraReader's frame↔mat scaling is exactly 1.0). Fall
+        # back to the legacy day-level constant-fps .avi sidecar only if the mp4 is
+        # absent (older days not yet re-extracted).
+        video_path = bag / "img" / cam / "image.mp4"
+        if not video_path.exists():
+            legacy_avi = day_dir / f"behave.20{dataset.day}.{rec_int}.{cam}.avi"
+            if not legacy_avi.exists():
+                print(f"Camera video not found: {video_path} (nor {legacy_avi})")
+                continue
+            video_path = legacy_avi
+        cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
-            print(f"Could not open video: {avi_path}")
+            print(f"Could not open video: {video_path}")
             continue
         readers[cam] = CameraReader(cap=cap, timestamps_ns=timestamps_ns)
     return readers

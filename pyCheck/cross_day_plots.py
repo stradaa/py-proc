@@ -415,6 +415,21 @@ def generate_cross_day_plots(
     except Exception as exc:  # noqa: BLE001
         print(f"cross_day_kinematics: skipped ({exc})")
 
+    # Companion structured-CO learning figure (separate file). Guarded: never
+    # let it break the core summary; skips cleanly on days with no
+    # schedule_phase data (pure-Python task, or pre-schedule recordings).
+    try:
+        from .cross_day_co_structured import generate_cross_day_co_structured
+
+        co_structured = generate_cross_day_co_structured(
+            repo_root_path, selections, out_dir_path
+        )
+        result["co_structured_figure_path"] = co_structured["figure_path"]
+        result["co_structured_metrics_json_path"] = co_structured["metrics_json_path"]
+        result["co_structured_metrics_csv_path"] = co_structured["metrics_csv_path"]
+    except Exception as exc:  # noqa: BLE001
+        print(f"cross_day_co_structured: skipped ({exc})")
+
     return result
 
 

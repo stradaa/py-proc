@@ -139,6 +139,12 @@ class ProcGuiWindow(QMainWindow):
         self.auto_plot_timer.timeout.connect(self.generate_selected_trial_plot)
         self._replay_player: Optional[QWidget] = None
         self._replay_windows: list[QWidget] = []  # floating ReplayPlayer windows
+        self._replay_load_seq = 0        # bumped per load; stale results are dropped
+        self._replay_loading = False     # guard against overlapping loads
+        self._replay_probe: dict[str, tuple] = {}   # {cam: (w,h,fps)} for the probed file
+        self._replay_probe_file: Optional[str] = None
+        self._replay_probe_seq = 0
+        self._replay_ram_warn_gb = 6.0   # confirm before loads larger than this
         self._monkey_dir: Optional[Path] = None
         _s = QSettings("PesaranLab", "ProcGui")
         _saved = _s.value("ProcGui/monkey_dir", "")
@@ -245,6 +251,21 @@ class ProcGuiWindow(QMainWindow):
         run_pipeline_btn = QPushButton("Run Day Pipeline")
         run_pipeline_btn.clicked.connect(self.run_processing_pipeline)
         processing_button_layout.addWidget(run_pipeline_btn)
+        cleanup_avi_btn = QPushButton("Delete sidecar .avi (cleanup)")
+        cleanup_avi_btn.clicked.connect(self.cleanup_sidecar_avi)
+        self._set_help_text(
+            cleanup_avi_btn,
+            (
+                "Delete the legacy day-level constant-fps sidecar videos\n"
+                "(behave.<day>.<idx>.<Cam>.avi) once the per-rec image.mp4 files\n"
+                "have been rebuilt. The mp4s are the correct timestamp-driven\n"
+                "video; the .avi are redundant and reconstructable from the behave\n"
+                "files. A sidecar is only deleted when its image.mp4 exists.\n\n"
+                "Uses the Pipeline Rec field (blank = all recs). Shows a\n"
+                "confirmation with the count and size before deleting."
+            ),
+        )
+        processing_button_layout.addWidget(cleanup_avi_btn)
         processing_layout.addWidget(processing_button_group)
         processing_layout.addStretch(1)
 
@@ -398,7 +419,19 @@ class ProcGuiWindow(QMainWindow):
             "Recording number. The behave capture file behave.<date>.<rec> in the "
             "current Day Dir is loaded straight from source."
         )
+        self.replay_rec_combo.currentTextChanged.connect(self._update_replay_resolved)
         replay_controls_form.addRow("Rec", self.replay_rec_combo)
+
+        # Live confirmation of exactly which behave file the Day Dir + Rec resolve
+        # to, so the selection is verified before a (slow) load is started.
+        self.replay_resolved_label = QLabel("Choose a Day Dir and Rec")
+        self.replay_resolved_label.setWordWrap(True)
+        self.replay_resolved_label.setStyleSheet("color:#888;")
+        self.replay_resolved_label.setToolTip(
+            "The capture file the current Day Dir + Rec resolve to. "
+            "A green ✓ means the file exists and is ready to load."
+        )
+        replay_controls_form.addRow("Source", self.replay_resolved_label)
 
         # Time window: start + stop seconds from recording start (pyReplay model).
         window_row = QHBoxLayout()
@@ -443,6 +476,54 @@ class ProcGuiWindow(QMainWindow):
         opts_row.addWidget(QLabel("Scroll ±"))
         opts_row.addWidget(self.replay_scroll_spin)
         replay_controls_form.addRow("Options", self._wrap_layout(opts_row))
+
+        # RAM controls: frame height (downscale) + max fps (decimation). Both
+        # bound the frames held in RAM for the whole window — see the live
+        # estimate below. Every kept frame stays resident for smooth playback.
+        ram_row = QHBoxLayout()
+        self.replay_height_spin = QSpinBox()
+        self.replay_height_spin.setRange(90, 1080)
+        self.replay_height_spin.setSingleStep(30)
+        self.replay_height_spin.setValue(360)
+        self.replay_height_spin.setSuffix(" px")
+        self.replay_height_spin.setToolTip(
+            "Decoded frame height. Frames are downsized to this; lower = far less "
+            "RAM (bytes scale with height²). 360 is the default; 240 ≈ 55% less, "
+            "180 ≈ 75% less."
+        )
+        self.replay_max_fps_spin = QSpinBox()
+        self.replay_max_fps_spin.setRange(0, 240)
+        self.replay_max_fps_spin.setSingleStep(5)
+        self.replay_max_fps_spin.setValue(30)
+        self.replay_max_fps_spin.setSpecialValueText("all")  # 0 -> keep every frame
+        self.replay_max_fps_spin.setSuffix(" fps")
+        self.replay_max_fps_spin.setToolTip(
+            "Cap kept frames per camera to this rate ('all' = keep every frame). "
+            "Playback and MP4 export both display at 30 fps, so 30 is visually "
+            "lossless yet cuts high-fps cameras (e.g. Cam Eye at 150 fps) several-fold."
+        )
+        for w in (self.replay_height_spin, self.replay_max_fps_spin):
+            w.valueChanged.connect(self._update_replay_ram_estimate)
+        self.replay_cameras_edit.textChanged.connect(self._update_replay_ram_estimate)
+        self.replay_start_spin.valueChanged.connect(self._update_replay_ram_estimate)
+        self.replay_stop_spin.valueChanged.connect(self._update_replay_ram_estimate)
+        self.replay_to_end_check.toggled.connect(self._update_replay_ram_estimate)
+        ram_row.addWidget(QLabel("Frame height"))
+        ram_row.addWidget(self.replay_height_spin)
+        ram_row.addSpacing(12)
+        ram_row.addWidget(QLabel("Max fps"))
+        ram_row.addWidget(self.replay_max_fps_spin)
+        ram_row.addStretch(1)
+        replay_controls_form.addRow("RAM", self._wrap_layout(ram_row))
+
+        self.replay_ram_label = QLabel("Estimated RAM: —")
+        self.replay_ram_label.setWordWrap(True)
+        self.replay_ram_label.setToolTip(
+            "Approximate RAM the loaded frames will hold, from a quick probe of "
+            "the file's camera sizes and frame rates. Updates as you change the "
+            "cameras, window, height, or max fps."
+        )
+        replay_controls_form.addRow("", self.replay_ram_label)
 
         self.load_replay_btn = QPushButton("Load Replay")
         self.load_replay_btn.clicked.connect(lambda: self.load_pyreplay(as_window=False))
@@ -895,6 +976,7 @@ class ProcGuiWindow(QMainWindow):
         self._refresh_cross_day_day_context(day_dir)
         self.status_label.setText(f"Loaded day {day_dir.name}")
         self._highlight_day_table_row(day_dir.name)
+        self._update_replay_resolved()
 
     def _find_day_notes_file(self, day_dir: Path) -> Optional[Path]:
         exact = sorted(day_dir.glob(f"{day_dir.name}_*.md"))
@@ -1272,6 +1354,56 @@ class ProcGuiWindow(QMainWindow):
             on_done=_done,
         )
 
+    def cleanup_sidecar_avi(self) -> None:
+        day_dir = self._day_dir_path()
+        if day_dir is None:
+            QMessageBox.warning(self, "proc_gui", "Choose a day directory first.")
+            return
+        rec_text = self.pipeline_rec_edit.text().strip() or None
+
+        from py_proc.cleanup_sidecars import delete_sidecar_avi
+
+        preview = delete_sidecar_avi(day_dir, rec=rec_text, dry_run=True)
+        n = len(preview["deleted"])
+        skipped = preview["skipped_no_mp4"]
+        if n == 0:
+            msg = "No sidecar .avi to delete"
+            if skipped:
+                msg += f" ({len(skipped)} skipped — no matching image.mp4)"
+            QMessageBox.information(self, "proc_gui", msg + ".")
+            return
+
+        gb = preview["bytes_deleted"] / 1e9
+        scope = f"rec {rec_text}" if rec_text else "all recs"
+        detail = (
+            f"Delete {n} sidecar .avi ({gb:.2f} GB) for {scope} in:\n{day_dir}\n\n"
+            "These are the legacy constant-fps videos; the per-rec image.mp4 files "
+            "remain and the .avi are reconstructable from the behave files."
+        )
+        if skipped:
+            detail += f"\n\n{len(skipped)} will be skipped (no matching image.mp4)."
+        reply = QMessageBox.question(
+            self, "Delete sidecar .avi", detail,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        res = delete_sidecar_avi(day_dir, rec=rec_text, dry_run=False)
+        freed = res["bytes_deleted"] / 1e9
+        self._append_log(
+            f"Deleted {len(res['deleted'])} sidecar .avi ({freed:.2f} GB) from {day_dir}"
+        )
+        for f in res["deleted"]:
+            self._append_log(f"  deleted: {f}")
+        if res["skipped_no_mp4"]:
+            self._append_log(f"  skipped {len(res['skipped_no_mp4'])} (no image.mp4)")
+        QMessageBox.information(
+            self, "proc_gui",
+            f"Deleted {len(res['deleted'])} sidecar .avi, freed {freed:.2f} GB.",
+        )
+
     def generate_validation_report(self) -> None:
         repo_root, day = self._repo_root_and_day()
         out_dir = self._out_dir_path()
@@ -1360,7 +1492,130 @@ class ProcGuiWindow(QMainWindow):
                 return matches[0]
         return None
 
+    def _update_replay_resolved(self) -> None:
+        """Refresh the 'Source' label so the current Day Dir + Rec selection is
+        confirmed (which behave file, and whether it exists) before any load."""
+        label = getattr(self, "replay_resolved_label", None)
+        if label is None:  # called before the replay tab is built
+            return
+        day_dir = self._day_dir_path()
+        rec = self.replay_rec_combo.currentText().strip()
+        if day_dir is None or not day_dir.is_dir():
+            label.setText("✗  Choose a valid Day Dir")
+            label.setStyleSheet("color:#c0392b;")
+            return
+        if not rec:
+            label.setText("✗  Choose a Rec")
+            label.setStyleSheet("color:#c0392b;")
+            return
+        behave = self._resolve_behave_path(day_dir, rec)
+        if behave is None:
+            label.setText(f"✗  No behave.*.{rec} file in {day_dir.name}")
+            label.setStyleSheet("color:#c0392b;")
+            return
+        try:
+            size_mb = behave.stat().st_size / (1024 * 1024)
+            size_txt = f"   ({size_mb:,.0f} MB)"
+        except OSError:
+            size_txt = ""
+        label.setText(f"✓  {day_dir.name} / rec {rec}  →  {behave.name}{size_txt}")
+        label.setStyleSheet("color:#1e8449;")
+        self._maybe_probe_replay(str(behave))
+
+    def _maybe_probe_replay(self, behave: str) -> None:
+        """Probe the resolved file's camera sizes/rates (once per file) so the
+        RAM estimate is accurate. Runs off the UI thread; cheap (~0.1 s)."""
+        if getattr(self, "replay_ram_label", None) is None:
+            return  # replay tab not fully built yet
+        if behave == self._replay_probe_file:
+            self._update_replay_ram_estimate()
+            return
+        self._replay_probe_file = behave
+        self._replay_probe = {}
+        self._replay_probe_seq += 1
+        seq = self._replay_probe_seq
+        self.replay_ram_label.setText("Estimated RAM: probing file…")
+        self.replay_ram_label.setStyleSheet("color:#888;")
+
+        from pyReplay.loader import probe_cameras
+
+        worker = Worker(probe_cameras, behave)
+        worker.signals.finished.connect(
+            lambda cams, logs, b=behave, s=seq: self._on_replay_probe(cams, b, s)
+        )
+        # A probe failure is non-fatal — just leave the estimate unknown.
+        worker.signals.error.connect(lambda _err, s=seq: self._on_replay_probe({}, None, s))
+        self.thread_pool.start(worker)
+
+    def _on_replay_probe(self, cams: Any, behave: Optional[str], seq: int) -> None:
+        if seq != self._replay_probe_seq:
+            return  # a newer probe superseded this one
+        self._replay_probe = cams if isinstance(cams, dict) else {}
+        self._update_replay_ram_estimate()
+
+    def _selected_replay_cameras(self) -> Optional[list[str]]:
+        text = self.replay_cameras_edit.text().strip()
+        return [c.strip() for c in text.split(",") if c.strip()] or None
+
+    def _replay_est_bytes(self, window_s: float) -> Optional[int]:
+        """Estimated frame RAM for the current controls, or None if not probed."""
+        if not self._replay_probe:
+            return None
+        from pyReplay.loader import estimate_frame_bytes
+
+        target_h = int(self.replay_height_spin.value())
+        max_fps = float(self.replay_max_fps_spin.value()) or None
+        wanted = self._selected_replay_cameras()
+        total = 0
+        for name, (w, h, fps) in self._replay_probe.items():
+            if wanted is not None and name not in wanted:
+                continue
+            total += estimate_frame_bytes(w, h, fps, window_s, target_h, max_fps)
+        return total
+
+    def _current_replay_window_s(self) -> Optional[float]:
+        """Window length in seconds, or None for 'to end' (unknown duration)."""
+        if self.replay_to_end_check.isChecked():
+            return None
+        return max(0.0, float(self.replay_stop_spin.value()) - float(self.replay_start_spin.value()))
+
+    def _update_replay_ram_estimate(self) -> None:
+        label = getattr(self, "replay_ram_label", None)
+        if label is None:
+            return
+        if not self._replay_probe:
+            label.setText("Estimated RAM: — (select a Day Dir + Rec)")
+            label.setStyleSheet("color:#888;")
+            return
+        window_s = self._current_replay_window_s()
+        if window_s is None:
+            label.setText("Estimated RAM: whole file (to end) — unknown, likely large")
+            label.setStyleSheet("color:#c0392b;")
+            return
+        est = self._replay_est_bytes(window_s)
+        if est is None:
+            label.setText("Estimated RAM: —")
+            label.setStyleSheet("color:#888;")
+            return
+        gb = est / 1e9
+        ncam = len(self._selected_replay_cameras() or self._replay_probe)
+        txt = f"Estimated RAM: ~{gb:.1f} GB  ({ncam} cam(s) × {window_s:g}s frames)"
+        if gb >= self._replay_ram_warn_gb:
+            label.setText(txt + "  — large; consider fewer cameras / lower height / lower max fps")
+            label.setStyleSheet("color:#c0392b;")
+        elif gb >= self._replay_ram_warn_gb / 2:
+            label.setText(txt)
+            label.setStyleSheet("color:#b8860b;")
+        else:
+            label.setText(txt)
+            label.setStyleSheet("color:#1e8449;")
+
     def load_pyreplay(self, as_window: bool = False) -> None:
+        if self._replay_loading:
+            QMessageBox.information(
+                self, "proc_gui", "A replay is still loading — wait for it to finish."
+            )
+            return
         day_dir = self._day_dir_path()
         if day_dir is None or not day_dir.is_dir():
             QMessageBox.warning(self, "proc_gui", "Choose a valid Day Dir first.")
@@ -1385,14 +1640,43 @@ class ProcGuiWindow(QMainWindow):
                 QMessageBox.warning(self, "proc_gui", "Stop must be greater than Start.")
                 return
 
-        cameras_text = self.replay_cameras_edit.text().strip()
-        camera_names = [c.strip() for c in cameras_text.split(",") if c.strip()] or None
+        camera_names = self._selected_replay_cameras()
         scroll_s = float(self.replay_scroll_spin.value())
+        target_h = int(self.replay_height_spin.value())
+        max_fps = float(self.replay_max_fps_spin.value()) or None
+
+        # Warn before a load that would hold a lot of RAM (frames stay resident
+        # for the whole window). "to end" has unknown length, so warn too.
+        window_s = self._current_replay_window_s()
+        est = None if window_s is None else self._replay_est_bytes(window_s)
+        if window_s is None or (est is not None and est / 1e9 >= self._replay_ram_warn_gb):
+            gb_txt = ("the whole file (unknown length)" if window_s is None
+                      else f"~{est / 1e9:.1f} GB")
+            resp = QMessageBox.question(
+                self, "proc_gui — large replay",
+                f"This load will hold {gb_txt} of decoded frames in RAM.\n\n"
+                "To reduce it: pick fewer Cameras, lower the Frame height, or "
+                "lower Max fps.\n\nLoad anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if resp != QMessageBox.StandardButton.Yes:
+                return
 
         # load_window decodes video — run it off the UI thread. ReplayPlayer is
         # built on the UI thread once the window is ready. Imported lazily so
         # app.py stays importable without the thalamus/Qt stack present.
         from pyReplay.loader import load_window
+
+        # Each load gets a sequence id; a result carrying a stale id (from an
+        # earlier day/rec whose worker finished late) is dropped rather than
+        # swapped in. Tear the embedded player down now so a failed/slow load
+        # never leaves a stale previous replay on screen.
+        self._replay_load_seq += 1
+        seq = self._replay_load_seq
+        self._replay_loading = True
+        if not as_window:
+            self._show_replay_placeholder("Loading…")
 
         stop_label = "end" if stop_s >= 999_999.0 else f"{stop_s:g}s"
         self.replay_status_label.setText(f"Loading {behave.name}  [{start_s:g}s – {stop_label}] …")
@@ -1400,20 +1684,36 @@ class ProcGuiWindow(QMainWindow):
         self.open_replay_window_btn.setEnabled(False)
         self._set_busy("Loading replay from source…")
 
-        worker = Worker(load_window, str(behave), start_s, stop_s, camera_names=camera_names)
+        worker = Worker(load_window, str(behave), start_s, stop_s,
+                        camera_names=camera_names, target_h=target_h, max_fps=max_fps)
         worker.signals.finished.connect(
-            lambda win, logs: self._on_pyreplay_loaded(win, logs, scroll_s, as_window)
+            lambda win, logs: self._on_pyreplay_loaded(win, logs, scroll_s, as_window, seq)
         )
-        worker.signals.error.connect(self._on_pyreplay_error)
+        worker.signals.error.connect(lambda err: self._on_pyreplay_error(err, seq))
         self.thread_pool.start(worker)
 
-    def _on_pyreplay_loaded(self, win: Any, logs: str, scroll_s: float, as_window: bool) -> None:
+    def _on_pyreplay_loaded(self, win: Any, logs: str, scroll_s: float,
+                            as_window: bool, seq: int) -> None:
         self._append_log(logs)
+        if seq != self._replay_load_seq:
+            return  # a newer load superseded this one — drop the stale result
+        self._replay_loading = False
         self._set_ready()
         self.load_replay_btn.setEnabled(True)
         self.open_replay_window_btn.setEnabled(True)
         if win is None:
             self.replay_status_label.setText("Load returned no data — see Output Log.")
+            if not as_window:
+                self._show_replay_placeholder("Load returned no data — see Output Log.")
+            return
+        if not self._replay_window_has_data(win):
+            msg = ("No camera frames, joystick, or analog data in this window.\n"
+                   "Check the Rec and time window (Start/Stop) and try again.")
+            self.replay_status_label.setText("Empty window — nothing to replay.")
+            if as_window:
+                QMessageBox.warning(self, "proc_gui", msg)
+            else:
+                self._show_replay_placeholder(msg)
             return
 
         from pyReplay.player import ReplayPlayer
@@ -1427,11 +1727,10 @@ class ProcGuiWindow(QMainWindow):
             player.show()
             player.raise_()
         else:
+            # The previous player + placeholder were already cleared in
+            # load_pyreplay; just build the fresh one into the empty container.
             self._teardown_replay_player()
-            if self.replay_placeholder is not None:
-                self.replay_placeholder.setParent(None)
-                self.replay_placeholder.deleteLater()
-                self.replay_placeholder = None
+            self._clear_replay_placeholder()
             player = ReplayPlayer(win, scroll_s=scroll_s)
             self.replay_player_container.layout().addWidget(player)
             self._replay_player = player
@@ -1441,23 +1740,62 @@ class ProcGuiWindow(QMainWindow):
         except Exception:
             self.replay_status_label.setText("Replay loaded.")
 
+    @staticmethod
+    def _replay_window_has_data(win: Any) -> bool:
+        """True if the loaded window has anything to render."""
+        try:
+            if any(len(t.frames) for t in win.cameras.values()):
+                return True
+            if len(win.joystick_t_ns):
+                return True
+            if any(len(t.t_ns) for t in win.analog.values()):
+                return True
+        except Exception:
+            return True  # unknown shape — let the player try
+        return False
+
+    def _clear_replay_placeholder(self) -> None:
+        if self.replay_placeholder is not None:
+            self.replay_placeholder.setParent(None)
+            self.replay_placeholder.deleteLater()
+            self.replay_placeholder = None
+
+    def _show_replay_placeholder(self, text: str) -> None:
+        """Put a text placeholder back in the embedded player slot (also used to
+        clear a stale replay when a new load starts or fails)."""
+        self._teardown_replay_player()
+        if self.replay_placeholder is None:
+            self.replay_placeholder = QLabel()
+            self.replay_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.replay_placeholder.setWordWrap(True)
+            self.replay_placeholder.setStyleSheet("color:#888;")
+            self.replay_player_container.layout().addWidget(self.replay_placeholder)
+        self.replay_placeholder.setText(text)
+
     def _forget_replay_window(self, player: QWidget) -> None:
         if player in self._replay_windows:
             self._replay_windows.remove(player)
 
-    def _on_pyreplay_error(self, error_text: str) -> None:
+    def _on_pyreplay_error(self, error_text: str, seq: int) -> None:
         self._append_log(error_text)
+        if seq != self._replay_load_seq:
+            return  # a newer load superseded this one
+        self._replay_loading = False
         self._set_ready("Error")
         self.load_replay_btn.setEnabled(True)
         self.open_replay_window_btn.setEnabled(True)
         self.replay_status_label.setText("Load failed — see Output Log.")
+        self._show_replay_placeholder("Load failed — see Output Log.")
         QMessageBox.critical(self, "proc_gui", error_text)
 
     def _teardown_replay_player(self) -> None:
         if self._replay_player is not None:
-            timer = getattr(self._replay_player, "timer", None)
-            if timer is not None:
-                timer.stop()
+            close = getattr(self._replay_player, "close_player", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
             self._replay_player.setParent(None)
             self._replay_player.deleteLater()
             self._replay_player = None

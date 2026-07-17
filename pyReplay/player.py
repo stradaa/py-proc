@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 )
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
+from pyReplay import adjust
 from pyReplay.blit import BlitManager
 from pyReplay.panels import SignalPanels
 from pyReplay.window import CameraTrack, ReplayWindow
@@ -97,13 +98,52 @@ class ReplayPlayer(QWidget):
         self.canvas.draw()
         self._render(self.cur_s)
 
+    # ---- lifecycle ----
+    def showEvent(self, event):  # noqa: N802 (Qt naming)
+        """Re-capture the blit background once the canvas has its real on-screen
+        size. __init__ draws before the layout sizes the canvas, so an embedded
+        player's first background can be the wrong geometry — which shows up as
+        blank/garbled panels on a consecutive load. Deferring to the event loop
+        guarantees the redraw happens after Qt has laid the canvas out."""
+        super().showEvent(event)
+        self.blit.invalidate()
+        QTimer.singleShot(0, self._refresh_blit)
+
+    def _refresh_blit(self):
+        # Deferred via singleShot, so it may fire after the player was torn down
+        # (close_player / deleteLater). Guard against a deleted C++ canvas.
+        try:
+            self.canvas.draw()
+            self._render(self.cur_s)
+        except RuntimeError:
+            pass
+
+    def close_player(self):
+        """Release the timer, matplotlib callbacks, and figure so the player can
+        be discarded and rebuilt cleanly across consecutive loads."""
+        try:
+            self.timer.stop()
+        except Exception:
+            pass
+        self.playing = False
+        try:
+            self.blit.disconnect()
+        except Exception:
+            pass
+        try:
+            self.panels.fig.clear()
+        except Exception:
+            pass
+
     # ---- UI construction ----
     def _build_cameras(self) -> QHBoxLayout:
         row = QHBoxLayout()
         self.cam_views: Dict[str, CameraView] = {}
+        self.cam_adjust: Dict[str, adjust.CameraAdjust] = {}
         for name in self.win.cameras:
             view = CameraView(name)
             self.cam_views[name] = view
+            self.cam_adjust[name] = adjust.resolve(name)
             col = QVBoxLayout()
             title = QLabel(name)
             title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -216,7 +256,7 @@ class ReplayPlayer(QWidget):
         t_ns = self.win.rel_to_ns(t_rel_s)
         for name, view in self.cam_views.items():
             track: CameraTrack = self.win.cameras[name]
-            view.set_frame(track.frame_at(t_ns))
+            view.set_frame(self.cam_adjust[name].apply(track.frame_at(t_ns)))
 
         self.panels.update(t_rel_s)
         self.blit.update()

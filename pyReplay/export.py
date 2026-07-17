@@ -16,6 +16,7 @@ import numpy as np
 from matplotlib.animation import FFMpegWriter
 from matplotlib.figure import Figure
 
+from pyReplay import adjust
 from pyReplay.panels import SignalPanels
 from pyReplay.window import ReplayWindow
 
@@ -37,6 +38,9 @@ def export_mp4(
     outer = fig.add_gridspec(2, 1, height_ratios=[3, 2], hspace=0.12,
                              left=0.05, right=0.97, top=0.95, bottom=0.08)
 
+    # Per-camera brightness/contrast/gamma correction (identity for unknowns).
+    cam_adjust = {name: adjust.resolve(name) for name in cams}
+
     # Camera row (imshow), one axis per camera.
     cam_gs = outer[0].subgridspec(1, ncam, wspace=0.04)
     cam_im = {}
@@ -45,8 +49,8 @@ def export_mp4(
         ax.set_title(name, fontsize=10)
         ax.set_xticks([]); ax.set_yticks([])
         first = win.cameras[name].frames[0] if win.cameras[name].frames else np.zeros((2, 2), np.uint8)
-        cam_im[name] = ax.imshow(first, cmap="gray", vmin=0, vmax=255,
-                                 aspect="equal", animated=True)
+        cam_im[name] = ax.imshow(cam_adjust[name].apply(first), cmap="gray",
+                                 vmin=0, vmax=255, aspect="equal", animated=True)
 
     # Joystick + trace panels reuse the live player's SignalPanels.
     panels = SignalPanels(win, scroll_s=scroll_s, fig=fig, host=outer[1])
@@ -62,7 +66,7 @@ def export_mp4(
             for name, im in cam_im.items():
                 frame = win.cameras[name].frame_at(t_ns)
                 if frame is not None:
-                    im.set_data(frame)
+                    im.set_data(cam_adjust[name].apply(frame))
             panels.update(t_rel)
             writer.grab_frame()
             if progress is not None and (i % 5 == 0 or i == n_frames - 1):

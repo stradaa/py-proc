@@ -103,6 +103,7 @@ def make_camera_video(
     times_ns: Sequence[int],
     dims: Sequence[Tuple[int, int]],
     out_path,
+    adjust=None,
 ) -> int:
     """Write ``out_path`` (an MP4) from one camera's encoded frames, 1:1.
 
@@ -110,9 +111,17 @@ def make_camera_video(
     is the ``record.time`` of packet ``i``; ``dims[i]`` is its ``(width, height)``.
     All three must be the same length and already filtered to valid frames.
 
-    Returns the number of frames written (== ``len(times_ns)`` on success).
-    Tries the lossless PyAV remux first; on any failure falls back to an ffmpeg
-    decode+re-encode. Both paths preserve frame↔timestamp correspondence.
+    ``adjust`` is an optional ``pyReplay.adjust.CameraAdjust`` giving this camera's
+    brightness/contrast/gamma correction. When it is ``None`` or the identity
+    correction, the frames are muxed **losslessly** (bit-exact pixels, fast). When
+    it applies a real correction, the frames must be decoded, the correction baked
+    in, and re-encoded — so the produced MP4 (a viewing product; nothing in the
+    processing pipeline reads its pixels) shows the same brightening as the live
+    player and MP4 export.
+
+    Returns the number of frames written (== ``len(times_ns)`` on success). Both
+    the lossless and the corrected route have a PyAV primary path and an ffmpeg
+    fallback; all preserve frame↔timestamp correspondence.
     """
     out_path = str(out_path)
     n = len(times_ns)
@@ -120,13 +129,35 @@ def make_camera_video(
         raise ValueError(f"no frames to write for {out_path}")
     width, height = int(dims[0][0]), int(dims[0][1])
 
+    corrected = adjust is not None and not adjust.is_identity
+
     # `packets` is iterated fresh by each path (a PacketSpool re-opens its file
     # per iteration), so we never materialize a whole camera in RAM.
-    try:
-        return _remux_pyav(packets, times_ns, width, height, out_path)
-    except Exception as exc:  # noqa: BLE001 — fall back on ANY PyAV problem
-        print(f"video_remux: PyAV remux failed ({exc!r}); re-encoding with ffmpeg")
-        return _reencode_ffmpeg(packets, times_ns, width, height, out_path)
+    if not corrected:
+        try:
+            return _remux_pyav(packets, times_ns, width, height, out_path)
+        except Exception as exc:  # noqa: BLE001 — fall back on ANY PyAV problem
+            print(f"video_remux: PyAV remux failed ({exc!r}); re-encoding with ffmpeg")
+            return _reencode_ffmpeg(packets, times_ns, width, height, out_path)
+
+    # Corrected camera: the pixels change, so we must decode + re-encode. We let
+    # ffmpeg decode the elementary stream (robust to B-frame reordering) and apply
+    # the correction as an `eq` filter — for the gamma-only corrections we use this
+    # matches CameraAdjust.lut() exactly. The output is set to the camera's real
+    # average frame rate (from record.time) so it plays at the right speed; the
+    # frames stay 1:1 with the .mat timestamps that remain the timing authority.
+    fps = _mean_fps(times_ns)
+    return _reencode_ffmpeg(packets, times_ns, width, height, out_path,
+                            vf=adjust.ffmpeg_eq(), fps=fps)
+
+
+def _mean_fps(times_ns: Sequence[int]) -> float:
+    """Average frame rate from record.time timestamps (0 if not derivable)."""
+    n = len(times_ns)
+    if n < 2:
+        return 0.0
+    span_s = (int(times_ns[-1]) - int(times_ns[0])) / 1e9
+    return (n - 1) / span_s if span_s > 0 else 0.0
 
 
 def _remux_pyav(
@@ -192,19 +223,33 @@ def _reencode_ffmpeg(
     width: int,
     height: int,
     out_path: str,
+    vf: str | None = None,
+    fps: float = 0.0,
 ) -> int:
-    """Fallback: decode the contiguous ES and re-encode 1:1 with libx264.
+    """Decode the contiguous MPEG4 ES and re-encode 1:1 with libx264.
 
-    The packets concatenate into a valid MPEG4 elementary stream (the first
-    carries the VOL header), so ffmpeg decodes it directly. ``-vsync 0`` keeps
-    one output frame per decoded frame, preserving the 1:1 mapping; the .mat
-    timestamps carry the true timing for downstream consumers.
+    Used both as the lossless-path fallback (when PyAV is unavailable) and as the
+    corrected path for cameras that need a brightness/contrast/gamma bake-in. The
+    packets concatenate into a valid MPEG4 elementary stream (the first carries
+    the VOL header), so ffmpeg decodes it directly; ``-vsync 0`` keeps one output
+    frame per decoded frame, preserving the 1:1 mapping the .mat timestamps rely
+    on.
+
+    ``vf`` optionally applies a filtergraph (e.g. ``eq=gamma=`` for the
+    correction). ``fps`` optionally stamps the stream at the camera's real average
+    frame rate (from record.time) so the file plays at the correct speed; without
+    it the re-encoded stream carries no meaningful timing (the .mat remains the
+    authority for every pipeline consumer).
     """
     tmp = out_path + ".tmp.mp4"
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "m4v", "-i", "pipe:",
-        "-vsync", "0",
+    in_args = ["-f", "m4v"]
+    if fps and fps > 0:
+        in_args += ["-r", f"{fps:.6f}"]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *in_args, "-i", "pipe:"]
+    cmd += ["-vsync", "cfr"] if (fps and fps > 0) else ["-vsync", "0"]
+    if vf:
+        cmd += ["-vf", vf]
+    cmd += [
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
         "-video_track_timescale", "90000",
         tmp,
@@ -220,4 +265,4 @@ def _reencode_ffmpeg(
     if rc != 0:
         raise RuntimeError(f"ffmpeg re-encode failed (rc={rc}) for {out_path}")
     os.replace(tmp, out_path)
-    return len(packets)
+    return len(times_ns)
