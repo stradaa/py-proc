@@ -15,9 +15,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 try:
-    from .cross_day_plots import _draw_mode_transitions
+    from .cross_day_axes import draw_mode_transitions, style_day_xaxis
 except ImportError:  # pragma: no cover - script-mode fallback
-    from cross_day_plots import _draw_mode_transitions
+    from cross_day_axes import draw_mode_transitions, style_day_xaxis
 
 
 def _line(ax, x, values, color, label=None, marker="o"):
@@ -90,11 +90,9 @@ def plot_cross_day_kinematics(rows: Sequence[Dict[str, Any]], out_path: Path) ->
 
     any_transition = False
     for ax in (ax_decomp, ax_rtcv, ax_dir, ax_submv, ax_sparc, ax_var, ax_engage, ax_throughput):
-        ax.set_xticks(x)
-        ax.set_xticklabels(days, rotation=25, ha="right")
-        ax.set_xlabel("Day")
+        style_day_xaxis(ax, days, x)
         ax.grid(alpha=0.2)
-        any_transition = _draw_mode_transitions(ax, rows) or any_transition
+        any_transition = draw_mode_transitions(ax, rows) or any_transition
 
     # (9) Direction-resolved success-rate heatmap
     _plot_direction_heatmap(ax_heat, rows, days)
@@ -130,14 +128,17 @@ def _plot_direction_heatmap(ax, rows, days) -> None:
                 matrix[i, j] = 100.0 * ds[str(t)]
 
     im = ax.imshow(matrix, aspect="auto", cmap="viridis", vmin=0, vmax=100, origin="lower")
-    ax.set_xticks(np.arange(len(days)))
-    ax.set_xticklabels(days, rotation=25, ha="right")
+    style_day_xaxis(ax, days, xlabel=None)
     labels = []
     for t in tidxs:
         xy = next((row["dir_xy"].get(str(t)) for row in rows if str(t) in row.get("dir_xy", {})), None)
         labels.append(f"tgt{t}\n({xy[0]:.2f},{xy[1]:.2f})" if xy else f"tgt{t}")
-    ax.set_yticks(np.arange(len(tidxs)))
-    ax.set_yticklabels(labels, fontsize=8)
+    # 60+ targets would stack their labels into a black smear; thin to a
+    # readable subset (the colour axis carries the signal, not the tick list).
+    step = max(1, int(np.ceil(len(tidxs) / 16)))
+    shown = np.arange(0, len(tidxs), step)
+    ax.set_yticks(shown)
+    ax.set_yticklabels([labels[i] for i in shown], fontsize=6.5)
     ax.set_xlabel("Day")
     ax.set_title("Direction-resolved success rate (%)")
     cbar = ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)

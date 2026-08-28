@@ -232,17 +232,43 @@ class ProcGuiWindow(QMainWindow):
         self.step_events_nodisplay_checkbox = QCheckBox("Step 2: Events (no-display)")
         self.step_detect_display_checkbox = QCheckBox("Step 3: Detect display states")
         self.step_full_proc_checkbox = QCheckBox("Step 4: Full processing")
-        self.step_save_trials_checkbox = QCheckBox("Step 5: Save trials")
+        self.step_aruco_checkbox = QCheckBox("Step 5: ArUco calibration")
+        self.step_save_trials_checkbox = QCheckBox("Step 6: Save trials")
         for cb in (
             self.step_extract_checkbox,
             self.step_events_nodisplay_checkbox,
             self.step_detect_display_checkbox,
             self.step_full_proc_checkbox,
+            self.step_aruco_checkbox,
             self.step_save_trials_checkbox,
         ):
             cb.setChecked(True)
             steps_layout.addWidget(cb)
+        self._set_help_text(
+            self.step_aruco_checkbox,
+            (
+                "Register all three cameras into the Aruco Static world frame\n"
+                "(origin = Screen 2x2 board centre, mm).  Writes calibration.npz,\n"
+                "calibration.json and the QC figures into <REC>.bag/aruco/.\n"
+                "Independent of trial count, and a failure never stops the run."
+            ),
+        )
         processing_form.addRow("Steps", steps_container)
+
+        self.cleanup_after_pipeline_checkbox = QCheckBox(
+            "Delete sidecar .avi when the pipeline finishes"
+        )
+        self._set_help_text(
+            self.cleanup_after_pipeline_checkbox,
+            (
+                "After a clean run, delete the legacy day-level constant-fps\n"
+                "behave.<day>.<idx>.<Cam>.avi files.  You are asked to confirm\n"
+                "before the pipeline starts.  Skipped automatically if any stage\n"
+                "failed, and a sidecar is only removed when its per-rec image.mp4\n"
+                "exists."
+            ),
+        )
+        processing_form.addRow("", self.cleanup_after_pipeline_checkbox)
 
         processing_layout.addWidget(processing_group)
 
@@ -644,7 +670,12 @@ class ProcGuiWindow(QMainWindow):
             (
                 "Generate cross-day summary figures and metrics for the selected day/recording set.\n\n"
                 "Outputs:\n"
-                "- cross_day_metrics.png: duration, post-entry stability, path efficiency, and successful trials.\n"
+                "- cross_day_metrics.png: duration, hold stability vs. hold demand, path efficiency, and successful trials.\n"
+                "- cross_day_hold_stability.png: hold requirement and target radius per day, hold stability scored both at "
+                "each day's own requirement and at one matched criterion, in-target dwell survival curves, and the time "
+                "cost of broken holds.\n"
+                "- cross_day_kinematics.png / cross_day_co_structured.png: companion learning figures (skipped when a day "
+                "has no data for them).\n"
                 "- cross_day_summary_metrics.json: selected-run summary.\n"
                 "- cross_day_summary_metrics.csv: cumulative day-by-day metrics that are preserved and updated over time.\n\n"
                 "Use this when you want to compare learning across days while keeping a running CSV as more sessions are collected."
@@ -734,9 +765,29 @@ class ProcGuiWindow(QMainWindow):
 
         right_splitter = QSplitter(Qt.Orientation.Horizontal)
 
+        images_container = QWidget()
+        images_layout = QVBoxLayout(images_container)
+        images_layout.setContentsMargins(0, 0, 0, 0)
+        images_layout.setSpacing(3)
+
+        self.include_aruco_checkbox = QCheckBox("Include ArUco figures")
+        self.include_aruco_checkbox.setChecked(True)
+        self._set_help_text(
+            self.include_aruco_checkbox,
+            (
+                "Also list the per-rec ArUco calibration figures, which live in\n"
+                "<DAY>/<REC>/rec<REC>.bag/aruco/ rather than in the day figures\n"
+                "directory.  They appear alongside the behaviour figures, tagged\n"
+                "with their rec."
+            ),
+        )
+        self.include_aruco_checkbox.toggled.connect(self.refresh_output_browser)
+        images_layout.addWidget(self.include_aruco_checkbox)
+
         self.image_list = QListWidget()
         self.image_list.itemSelectionChanged.connect(self._show_selected_image)
-        right_splitter.addWidget(self.image_list)
+        images_layout.addWidget(self.image_list)
+        right_splitter.addWidget(images_container)
 
         self.preview = ImagePreview()
         right_splitter.addWidget(self.preview)
@@ -1193,22 +1244,57 @@ class ProcGuiWindow(QMainWindow):
         self.current_image = image_path
         self.preview.set_image(image_path)
 
+    def _aruco_figures(self, day_dir: Optional[Path]) -> list[tuple[str, Path]]:
+        """(label, path) for every per-rec ArUco figure under the selected day.
+
+        These are written next to the calibration they document, one directory
+        per rec, so they are collected here rather than being copied into the
+        day figures directory.
+        """
+        if day_dir is None or not day_dir.exists():
+            return []
+        found: list[tuple[str, Path]] = []
+        day_level = day_dir / "aruco"
+        if day_level.is_dir():
+            for image_path in sorted(day_level.iterdir()):
+                if image_path.suffix.lower() in IMAGE_SUFFIXES:
+                    found.append((f"[aruco day] {image_path.name}", image_path))
+        for rec_dir in sorted(day_dir.iterdir()):
+            if not (rec_dir.is_dir() and rec_dir.name.isdigit()):
+                continue
+            aruco_dir = rec_dir / f"rec{rec_dir.name}.bag" / "aruco"
+            if not aruco_dir.is_dir():
+                continue
+            for image_path in sorted(aruco_dir.iterdir()):
+                if image_path.suffix.lower() in IMAGE_SUFFIXES:
+                    found.append((f"[aruco {rec_dir.name}] {image_path.name}", image_path))
+        return found
+
     def refresh_output_browser(self) -> None:
         out_dir = self._out_dir_path()
         self.output_dir_path = out_dir
         self.image_list.clear()
-        if out_dir is None or not out_dir.exists():
-            self.preview.clear_image("Output directory does not exist yet")
+
+        entries: list[tuple[str, Path]] = []
+        if out_dir is not None and out_dir.exists():
+            entries += [(p.name, p) for p in sorted(out_dir.iterdir())
+                        if p.suffix.lower() in IMAGE_SUFFIXES]
+        if self.include_aruco_checkbox.isChecked():
+            entries += self._aruco_figures(self._day_dir_path())
+
+        if not entries:
+            if out_dir is None or not out_dir.exists():
+                self.preview.clear_image("Output directory does not exist yet")
+            else:
+                self.preview.clear_image("No images found in output directory")
             return
-        images = sorted([p for p in out_dir.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES])
-        for image_path in images:
-            item = QListWidgetItem(image_path.name)
+
+        for label, image_path in entries:
+            item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, str(image_path))
+            item.setToolTip(str(image_path))
             self.image_list.addItem(item)
-        if images:
-            self.image_list.setCurrentRow(0)
-        else:
-            self.preview.clear_image("No images found in output directory")
+        self.image_list.setCurrentRow(0)
 
     def _set_output_browser_dir(self, out_dir: Path) -> None:
         self.out_dir_edit.setText(str(out_dir))
@@ -1339,26 +1425,125 @@ class ProcGuiWindow(QMainWindow):
             "events_nodisplay": self.step_events_nodisplay_checkbox,
             "detect_display": self.step_detect_display_checkbox,
             "full_proc": self.step_full_proc_checkbox,
+            "aruco_calib": self.step_aruco_checkbox,
             "save_trials": self.step_save_trials_checkbox,
         }
-        steps = {name for name, cb in step_map.items() if cb.isChecked()} or None
+        steps = {name for name, cb in step_map.items() if cb.isChecked()}
+        if not steps:
+            # An empty set would fall through to run_day_pipeline's "all steps"
+            # default, which silently includes extraction.  Treat it as a no-op.
+            QMessageBox.warning(self, "proc_gui", "No pipeline steps are selected.")
+            return
+
+        # Confirm the destructive cleanup up front, not after the run.
+        cleanup = self.cleanup_after_pipeline_checkbox.isChecked()
+        if cleanup and not self._confirm_post_pipeline_cleanup(day_dir, rec_text):
+            return
 
         def _done(result: Any) -> None:
             self._sync_day_dir_fields()
             self._refresh_day_table()
             if isinstance(result, dict):
                 self._append_log(json_like(result))
+                self._append_log(self._aruco_qc_summary(day_dir, result.get("recs_processed")))
+            self.refresh_output_browser()
 
         self._run_worker(
             "Running day pipeline...",
-            run_day_pipeline,
+            self._pipeline_with_cleanup,
             day_dir,
+            cleanup=cleanup,
             skip_video=self.skip_video_checkbox.isChecked(),
             skip_existing_video=self.skip_existing_video_checkbox.isChecked(),
             rec=rec_text,
             steps=steps,
             on_done=_done,
         )
+
+    def _confirm_post_pipeline_cleanup(self, day_dir: Path, rec_text: Optional[str]) -> bool:
+        """Preview the sidecar deletion and ask before the pipeline starts."""
+        from py_proc.cleanup_sidecars import delete_sidecar_avi
+
+        preview = delete_sidecar_avi(day_dir, rec=rec_text, dry_run=True)
+        n = len(preview["deleted"])
+        if n == 0:
+            QMessageBox.information(
+                self, "proc_gui",
+                "Nothing to clean up: no sidecar .avi matched.\n"
+                "The pipeline will run without the deletion step.",
+            )
+            return True
+        gb = preview["bytes_deleted"] / 1e9
+        scope = f"rec {rec_text}" if rec_text else "all recs"
+        detail = (
+            f"When the pipeline finishes, delete {n} sidecar .avi ({gb:.2f} GB) "
+            f"for {scope} in:\n{day_dir}\n\n"
+            "These are the legacy constant-fps videos; the per-rec image.mp4 files "
+            "remain and the .avi are reconstructable from the behave files.\n\n"
+            "The deletion is skipped if any pipeline stage fails."
+        )
+        reply = QMessageBox.question(
+            self, "Run pipeline, then delete sidecar .avi", detail,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
+    @staticmethod
+    def _pipeline_with_cleanup(day_dir: Path, *, cleanup: bool, **kwargs: Any) -> dict:
+        """Run the pipeline, then optionally delete the sidecar .avi.
+
+        Runs in the worker thread so the deletion is sequential with the run and
+        its output lands in the same log.  Deletion is gated on a clean run: the
+        .avi are the only thing here that cannot be undone.
+        """
+        from py_proc.cleanup_sidecars import delete_sidecar_avi
+
+        result = run_day_pipeline(day_dir, **kwargs)
+        if not cleanup:
+            return result
+        failures = result.get("failures") or []
+        if failures:
+            print(f"\nSidecar .avi cleanup SKIPPED — {len(failures)} stage(s) failed.")
+            result["sidecar_cleanup"] = {"skipped_due_to_failures": len(failures)}
+            return result
+        res = delete_sidecar_avi(day_dir, rec=kwargs.get("rec"), dry_run=False)
+        print(f"\nDeleted {len(res['deleted'])} sidecar .avi "
+              f"({res['bytes_deleted'] / 1e9:.2f} GB freed).")
+        result["sidecar_cleanup"] = {
+            "deleted": len(res["deleted"]),
+            "gb_freed": round(res["bytes_deleted"] / 1e9, 2),
+            "skipped_no_mp4": len(res["skipped_no_mp4"]),
+        }
+        return result
+
+    def _aruco_qc_summary(self, day_dir: Path, recs: Any) -> str:
+        """One line per rec of ArUco QC, read back from each calibration.json."""
+        if not recs:
+            return ""
+        lines = []
+        for rec in recs:
+            meta = day_dir / rec / f"rec{rec}.bag" / "aruco" / "calibration.json"
+            if not meta.exists():
+                continue
+            try:
+                data = json.loads(meta.read_text())
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"  rec{rec}: could not read calibration.json — {exc}")
+                continue
+            qc = data.get("qc", {})
+            verdict = "PASS" if qc.get("passed") else "FAIL"
+            cams = ", ".join(
+                f"{cam.replace('Cam ', '')} {info['reproj_px']:.2f}px"
+                for cam, info in sorted(data.get("cameras", {}).items())
+            )
+            line = f"  rec{rec}: {verdict}  {cams}"
+            if qc.get("reasons"):
+                line += "  [" + "; ".join(qc["reasons"]) + "]"
+            lines.append(line)
+        if not lines:
+            return ""
+        return "ArUco calibration QC:\n" + "\n".join(lines)
 
     def cleanup_sidecar_avi(self) -> None:
         day_dir = self._day_dir_path()

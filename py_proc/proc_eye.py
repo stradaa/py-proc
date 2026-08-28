@@ -12,7 +12,8 @@ from scipy.io import loadmat
 from scipy.interpolate import PchipInterpolator
 from scipy.signal.windows import dpss
 
-from .helpers import rec_paths, get_fs_rec, get_gaze_transform, load_w_alignment
+from .helpers import (rec_paths, get_fs_rec, get_gaze_transform,
+                      load_bag_topic, load_w_alignment)
 
 
 def proc_eye(day, rec, monkeydir, out_suffix=''):
@@ -38,12 +39,17 @@ def proc_eye(day, rec, monkeydir, out_suffix=''):
     w_drift_ros = load_w_alignment(py_pref)
 
     # ---- Load eye data from bag/mat/ ----------------------------------------
-    eye_mat = loadmat(os.path.join(bag_dir, 'mat', 'oculomatic_eye.mat'),
-                      simplify_cells=True)
-    eye_msgs = eye_mat.get('oculomatic_eye', eye_mat)
-
-    if not eye_msgs or not (isinstance(eye_msgs, dict) and eye_msgs):
+    # oculomatic_eye.mat is written even when the eye tracker was not running,
+    # so an empty topic is a normal outcome, not an error.
+    eye_msgs = load_bag_topic(bag_dir, 'oculomatic_eye.mat', 'oculomatic_eye')
+    if eye_msgs is None:
         print('  No eye data present, skipping')
+        return
+
+    required = ('header_stamp_sec', 'header_stamp_nanosec', 'x', 'y')
+    missing = [k for k in required if k not in eye_msgs]
+    if missing:
+        print(f'  oculomatic_eye.mat missing fields {missing}, skipping')
         return
 
     t_eye_header = (np.asarray(eye_msgs['header_stamp_sec'], dtype=float).ravel()
@@ -53,6 +59,10 @@ def proc_eye(day, rec, monkeydir, out_suffix=''):
         np.asarray(eye_msgs['x'], dtype=float).ravel(),
         np.asarray(eye_msgs['y'], dtype=float).ravel()
     ])  # 2 × n_eye_samples
+
+    if eye_in.shape[1] == 0 or len(t_eye_header) == 0:
+        print('  No eye samples present, skipping')
+        return
 
     # Mask invalid (oculomatic outputs 1e6 when pupil not visible)
     eye_in[eye_in == 1e6] = np.nan
@@ -112,8 +122,13 @@ def proc_eye(day, rec, monkeydir, out_suffix=''):
     for ch in range(2):
         yA[ch, :patch_n] = yA[ch, patch_n]
 
-    # Re-center to original median (robust to outliers, matches procEye.m fix)
+    # Re-center to original median (robust to outliers, matches procEye.m fix).
+    # Skip channels with no valid samples — nanmedian of an all-NaN channel is
+    # NaN and would poison the whole trace.
     for ch in range(2):
+        if np.all(np.isnan(eye_deg_rec[ch])):
+            print(f'  WARNING: eye channel {ch} has no valid samples, left uncentered')
+            continue
         yA[ch] += np.nanmedian(eye_deg_rec[ch]) - np.nanmedian(yA[ch])
 
     # ---- Save recNNN.lp.seye.dat as float32 (2×N column-major) --------------

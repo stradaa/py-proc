@@ -70,6 +70,31 @@ def load_mat_bag(bag_dir, filename):
     return loadmat(os.path.join(bag_dir, 'mat', filename), simplify_cells=True)
 
 
+def load_bag_topic(bag_dir, filename, key=None):
+    """Load a ROS-topic .mat from bag/mat/, or None when the topic carries no data.
+
+    A node that was never plugged in (e.g. the touchscreen) still produces a
+    .mat file, but every field is a zero-length array.  Returning None here lets
+    callers skip that modality instead of crashing on an empty array, so the
+    pipeline does not depend on which nodes were connected that day.
+
+    Returns the field dict (metadata keys stripped) or None.
+    """
+    path = os.path.join(bag_dir, 'mat', filename)
+    if not os.path.exists(path):
+        return None
+    mat = loadmat(path, simplify_cells=True)
+    msgs = mat.get(key, mat) if key is not None else mat
+    if not isinstance(msgs, dict):
+        return None
+    fields = {k: v for k, v in msgs.items() if not k.startswith('__')}
+    if not fields:
+        return None
+    if all(np.asarray(v).size == 0 for v in fields.values()):
+        return None
+    return fields
+
+
 def load_w_alignment(rec_pref):
     """Load w_drift_ros from .w_alignment.mat → 1-D array [offset, slope]."""
     data = loadmat(f'{rec_pref}.w_alignment.mat', simplify_cells=True)

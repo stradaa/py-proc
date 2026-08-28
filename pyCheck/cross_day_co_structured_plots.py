@@ -15,9 +15,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 try:
-    from .cross_day_plots import _draw_mode_transitions
+    from .cross_day_axes import draw_mode_transitions, style_day_xaxis
 except ImportError:  # pragma: no cover - script-mode fallback
-    from cross_day_plots import _draw_mode_transitions
+    from cross_day_axes import draw_mode_transitions, style_day_xaxis
 
 
 def _line(ax, x, values, color, label=None, marker="o"):
@@ -79,11 +79,9 @@ def plot_cross_day_co_structured(rows: Sequence[Dict[str, Any]], out_path: Path)
     ax_attempts.legend(loc="best", frameon=False, fontsize=8)
 
     for ax in (ax_success, ax_speed, ax_path, ax_pairs, ax_attempts):
-        ax.set_xticks(x)
-        ax.set_xticklabels(days, rotation=25, ha="right")
-        ax.set_xlabel("Day")
+        style_day_xaxis(ax, days, x)
         ax.grid(alpha=0.2)
-        _draw_mode_transitions(ax, rows)
+        draw_mode_transitions(ax, rows)
 
     # (6) Direction-resolved success-rate heatmap
     _plot_direction_heatmap(ax_heat, rows, days)
@@ -114,8 +112,7 @@ def _plot_direction_heatmap(ax, rows, days) -> None:
                 matrix[i, j] = 100.0 * ds[str(angle)]
 
     im = ax.imshow(matrix, aspect="auto", cmap="viridis", vmin=0, vmax=100, origin="lower")
-    ax.set_xticks(np.arange(len(days)))
-    ax.set_xticklabels(days, rotation=25, ha="right")
+    style_day_xaxis(ax, days, xlabel=None)
     ax.set_yticks(np.arange(len(angles)))
     ax.set_yticklabels([f"{angle}°" for angle in angles], fontsize=8)
     ax.set_xlabel("Day")

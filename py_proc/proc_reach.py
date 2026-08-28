@@ -33,6 +33,14 @@ def proc_reach(day, rec, monkeydir, out_suffix=''):
         print('  No reach trials, skipping')
         return
 
+    # Reach detection reads .scaledhnd.dat, which proc_hand only writes when the
+    # touchscreen was connected.  Without it every trial would silently resolve
+    # to NaN, so skip the step and leave Events untouched.
+    hnd_file = f'{py_pref}.scaledhnd.dat'
+    if not os.path.exists(hnd_file):
+        print(f'  No hand data ({os.path.basename(hnd_file)} not found), skipping')
+        return
+
     print(f'  Processing {len(reach_trials)} reach trials')
 
     for itrial in reach_trials:

@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import matplotlib.pyplot as plt
 import numpy as np
 from scipy.io import loadmat
 
@@ -14,6 +13,13 @@ try:
     from .joystick_validation import _get_final_attempt, get_trial_row, load_joystick_dataset, select_attempt_event
 except ImportError:
     from joystick_validation import _get_final_attempt, get_trial_row, load_joystick_dataset, select_attempt_event
+
+try:
+    from .cross_day_hold import HOLD_SUMMARY_FIELDS, HoldAccumulator, resolve_reference_hold
+    from .cross_day_metrics_plots import plot_cross_day_metrics
+except ImportError:  # pragma: no cover - script-mode fallback
+    from cross_day_hold import HOLD_SUMMARY_FIELDS, HoldAccumulator, resolve_reference_hold
+    from cross_day_metrics_plots import plot_cross_day_metrics
 
 
 def _load_all_trials(repo_root: Path, day: str) -> Dict[str, np.ndarray]:
@@ -152,6 +158,7 @@ def _build_day_summary(
     hold_break_flags: List[float] = []
     first_entry_success_flags: List[float] = []
     path_efficiencies: List[float] = []
+    hold = HoldAccumulator()
     successful_trials = 0
     included_trials = 0
     control_modes: set[str] = set()
@@ -201,6 +208,14 @@ def _build_day_summary(
                 )
                 first_entry_success_flags.append(float(first_entry_success))
 
+            hold.add_trial(
+                attempt,
+                events,
+                success,
+                float(target_on_event["time_perf_counter"]) if target_on_event is not None else float("nan"),
+                float(hold_complete_event["time_perf_counter"]) if hold_complete_event is not None else float("nan"),
+            )
+
             if not success or target_on_event is None or hold_complete_event is None:
                 continue
 
@@ -221,7 +236,7 @@ def _build_day_summary(
                 path_efficiencies.append(efficiency)
 
     control_mode_label, blend_repr, mode_mixed = _summarize_modes(control_modes, blend_values)
-    return {
+    summary = {
         "day": day,
         "selected_recs": [int(rec) for rec in recs],
         "control_mode": control_mode_label,
@@ -238,6 +253,8 @@ def _build_day_summary(
         "first_entry_success_rate": float(np.nanmean(first_entry_success_flags)) if first_entry_success_flags else float("nan"),
         "median_path_efficiency": float(np.nanmedian(path_efficiencies)) if path_efficiencies else float("nan"),
     }
+    summary.update(hold.summary())
+    return summary
 
 
 def _summarize_modes(
@@ -275,9 +292,11 @@ def _write_summary_csv(rows: Sequence[Dict[str, Any]], out_path: Path) -> None:
         "hold_break_rate_after_entry",
         "first_entry_success_rate",
         "median_path_efficiency",
-    ]
+    ] + list(HOLD_SUMMARY_FIELDS)
     with open(out_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        # extrasaction: rows also carry the survival-count lists, which belong
+        # in the JSON only.
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             formatted = dict(row)
@@ -286,28 +305,44 @@ def _write_summary_csv(rows: Sequence[Dict[str, Any]], out_path: Path) -> None:
 
 
 def _load_summary_csv(out_path: Path) -> List[Dict[str, Any]]:
+    """Read back a previously written summary CSV for merging.
+
+    Field-agnostic on purpose: numeric-looking columns are floated, counts are
+    kept integral, and anything else passes through as text, so days written by
+    an older run keep their columns when a new run merges into the same file.
+    """
     if not out_path.exists():
         return []
+    integer_fields = {
+        "control_mode_mixed",
+        "n_included_trials",
+        "n_successful_trials",
+        "n_trials_with_entry",
+        "n_successful_durations",
+        "n_path_efficiency_trials",
+        "n_hold_attempts",
+        "n_trials_with_hold",
+    }
     with open(out_path, "r", newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
         rows: List[Dict[str, Any]] = []
         for raw in reader:
-            rows.append(
-                {
-                    "day": str(raw.get("day", "")).strip(),
-                    "selected_recs": [int(token) for token in str(raw.get("selected_recs", "")).split(",") if token.strip()],
-                    "n_included_trials": int(float(raw.get("n_included_trials", 0) or 0)),
-                    "n_successful_trials": int(float(raw.get("n_successful_trials", 0) or 0)),
-                    "n_trials_with_entry": int(float(raw.get("n_trials_with_entry", 0) or 0)),
-                    "n_successful_durations": int(float(raw.get("n_successful_durations", 0) or 0)),
-                    "n_path_efficiency_trials": int(float(raw.get("n_path_efficiency_trials", 0) or 0)),
-                    "median_successful_trial_duration_s": float(raw.get("median_successful_trial_duration_s", "nan")),
-                    "mean_successful_target_radius": float(raw.get("mean_successful_target_radius", "nan")),
-                    "hold_break_rate_after_entry": float(raw.get("hold_break_rate_after_entry", "nan")),
-                    "first_entry_success_rate": float(raw.get("first_entry_success_rate", "nan")),
-                    "median_path_efficiency": float(raw.get("median_path_efficiency", "nan")),
-                }
-            )
+            row: Dict[str, Any] = {"day": str(raw.get("day", "")).strip()}
+            row["selected_recs"] = [
+                int(token) for token in str(raw.get("selected_recs", "")).split(",") if token.strip()
+            ]
+            for key, value in raw.items():
+                if key in ("day", "selected_recs"):
+                    continue
+                text = "" if value is None else str(value).strip()
+                if key in integer_fields:
+                    row[key] = int(float(text)) if text else 0
+                    continue
+                try:
+                    row[key] = float(text) if text else float("nan")
+                except ValueError:
+                    row[key] = text
+            rows.append(row)
         return rows
 
 
@@ -316,102 +351,6 @@ def _merge_summary_rows(existing_rows: Sequence[Dict[str, Any]], new_rows: Seque
     for row in new_rows:
         merged[str(row["day"])] = dict(row)
     return [merged[day] for day in sorted(merged)]
-
-
-def _draw_mode_transitions(ax, rows: Sequence[Dict[str, Any]]) -> bool:
-    """Mark where control_mode changes between consecutive (day-sorted) rows
-    with a vertical line + label, and shade any 'mixed' days. Trends stay pooled
-    (single line); the marker just flags where the control law changed so
-    boundary steps aren't misread as skill change. Returns True if any drawn."""
-    labels = [str(row.get("control_mode", "")) for row in rows]
-    drawn = False
-    for i, row in enumerate(rows):
-        if int(row.get("control_mode_mixed", 0)):
-            ax.axvspan(i - 0.5, i + 0.5, color="#999999", alpha=0.12, zorder=0)
-            drawn = True
-    for i in range(1, len(labels)):
-        if labels[i] != labels[i - 1]:
-            ax.axvline(i - 0.5, color="#c0392b", linestyle="--", linewidth=1.3, alpha=0.8, zorder=2)
-            ax.text(
-                i - 0.5, 0.98, f"→ {labels[i]}", transform=ax.get_xaxis_transform(),
-                rotation=90, va="top", ha="right", fontsize=8, color="#c0392b", alpha=0.9,
-            )
-            drawn = True
-    return drawn
-
-
-def _plot_cross_day_metrics(rows: Sequence[Dict[str, Any]], out_path: Path) -> None:
-    days = [str(row["day"]) for row in rows]
-    x = np.arange(len(days), dtype=float)
-
-    duration = np.asarray([row["median_successful_trial_duration_s"] for row in rows], dtype=float)
-    radius = np.asarray([row["mean_successful_target_radius"] for row in rows], dtype=float)
-    hold_break_rate = 100.0 * np.asarray([row["hold_break_rate_after_entry"] for row in rows], dtype=float)
-    first_entry_success = 100.0 * np.asarray([row["first_entry_success_rate"] for row in rows], dtype=float)
-    path_efficiency = np.asarray([row["median_path_efficiency"] for row in rows], dtype=float)
-    successful_trials = np.asarray([row["n_successful_trials"] for row in rows], dtype=float)
-
-    fig, axes = plt.subplots(2, 2, figsize=(13.5, 9.0))
-    ax_duration, ax_rates, ax_path, ax_successful = axes.ravel()
-
-    finite_radius = np.isfinite(radius)
-    if np.any(np.isfinite(duration)):
-        ax_duration.plot(x, duration, color="#1f4e79", linewidth=1.8, alpha=0.7, zorder=1)
-        scatter = ax_duration.scatter(
-            x,
-            duration,
-            c=radius if np.any(finite_radius) else np.full_like(duration, 0.0),
-            cmap="viridis",
-            s=90,
-            edgecolor="black",
-            linewidth=0.5,
-            zorder=3,
-        )
-        if np.any(finite_radius):
-            cbar = fig.colorbar(scatter, ax=ax_duration, fraction=0.046, pad=0.04)
-            cbar.set_label("Mean successful target radius")
-    ax_duration.set_ylabel("Seconds")
-    ax_duration.set_title("Median successful trial duration by day")
-    ax_duration.grid(alpha=0.2)
-
-    ax_rates.plot(x, hold_break_rate, marker="o", color="#b279a2", linewidth=2, label="Hold-break rate after first entry")
-    ax_rates.plot(x, first_entry_success, marker="o", color="#2ca25f", linewidth=2, label="First-entry success rate")
-    ax_rates.set_ylabel("Rate (%)")
-    ax_rates.set_ylim(0, 105)
-    ax_rates.set_title("Post-entry stability and first-entry success")
-    ax_rates.grid(alpha=0.2)
-    ax_rates.legend(loc="best", frameon=False)
-
-    ax_path.plot(x, path_efficiency, marker="o", color="#e67e22", linewidth=2)
-    ax_path.set_ylabel("Path / straight-line")
-    ax_path.set_title("Median path efficiency by day  (control-law sensitive)")
-    ax_path.grid(alpha=0.2)
-
-    ax_successful.bar(x, successful_trials, color="#4c78a8", alpha=0.85, width=0.7)
-    ax_successful.set_ylabel("Successful trials")
-    ax_successful.set_title("Successful trials by day")
-    ax_successful.grid(axis="y", alpha=0.2)
-
-    any_transition = False
-    for ax in [ax_duration, ax_rates, ax_path, ax_successful]:
-        ax.set_xticks(x)
-        ax.set_xticklabels(days, rotation=25, ha="right")
-        ax.set_xlabel("Day")
-        any_transition = _draw_mode_transitions(ax, rows) or any_transition
-
-    if any_transition:
-        fig.text(
-            0.5, 0.005,
-            "Dashed line = cursor control-mode change; shaded = mixed-mode day. "
-            "Path efficiency (and other cursor-kinematic metrics) is control-law sensitive: "
-            "steps at a transition may reflect the control law, not skill.",
-            ha="center", va="bottom", fontsize=8, color="#555555",
-        )
-        fig.tight_layout(rect=(0, 0.03, 1, 1))
-    else:
-        fig.tight_layout()
-    fig.savefig(out_path, dpi=180)
-    plt.close(fig)
 
 
 def generate_cross_day_plots(
@@ -436,7 +375,8 @@ def generate_cross_day_plots(
     metrics_json_path = out_dir_path / "cross_day_summary_metrics.json"
     metrics_csv_path = out_dir_path / "cross_day_summary_metrics.csv"
 
-    _plot_cross_day_metrics(rows, figure_path)
+    reference_hold_s = resolve_reference_hold(rows)
+    plot_cross_day_metrics(rows, figure_path, reference_hold_s)
     merged_rows = _merge_summary_rows(_load_summary_csv(metrics_csv_path), rows)
     _write_summary_csv(merged_rows, metrics_csv_path)
     with open(metrics_json_path, "w", encoding="utf-8") as fh:
@@ -445,6 +385,7 @@ def generate_cross_day_plots(
                 "selections": [{"day": row["day"], "selected_recs": row["selected_recs"]} for row in rows],
                 "task_types": sorted(requested_task_types),
                 "figure_path": str(figure_path),
+                "reference_hold_s": reference_hold_s,
                 "days": rows,
                 "csv_days": merged_rows,
             },
@@ -458,11 +399,28 @@ def generate_cross_day_plots(
 
     result = {
         "figure_path": str(figure_path),
+        "reference_hold_s": reference_hold_s,
         "metrics_json_path": str(metrics_json_path),
         "metrics_csv_path": str(metrics_csv_path),
         "days": rows,
         "csv_days": merged_rows,
     }
+
+    # Companion hold-stability figure (separate file). Uses the rows already
+    # built above, so it costs no extra data loading. Guarded: never let it
+    # break the core summary.
+    try:
+        try:
+            from .cross_day_hold_plots import plot_cross_day_hold
+        except ImportError:  # pragma: no cover - script-mode fallback
+            from cross_day_hold_plots import plot_cross_day_hold
+
+        hold_figure_path = out_dir_path / "cross_day_hold_stability.png"
+        plot_cross_day_hold(rows, hold_figure_path, reference_hold_s)
+        result["hold_figure_path"] = str(hold_figure_path)
+        print(f"Saved figure: {hold_figure_path}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"cross_day_hold_stability: skipped ({exc})")
 
     # Companion learning-kinematics figure (separate file, so the headline figure
     # above stays uncluttered). Guarded: never let it break the core summary.

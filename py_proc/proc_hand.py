@@ -12,7 +12,8 @@ import numpy as np
 from scipy.io import loadmat
 from scipy.interpolate import interp1d
 
-from .helpers import rec_paths, get_fs_rec, get_touch_transform, load_w_alignment
+from .helpers import (rec_paths, get_fs_rec, get_touch_transform,
+                      load_bag_topic, load_w_alignment)
 
 
 def proc_hand(day, rec, monkeydir, out_suffix=''):
@@ -23,17 +24,18 @@ def proc_hand(day, rec, monkeydir, out_suffix=''):
     py_pref = rec_pref + out_suffix
     print(f'\nproc_hand: day={day} rec={rec}')
 
-    serialhnd_file = os.path.join(bag_dir, 'mat', 'serialhnd.mat')
-    if not os.path.exists(serialhnd_file):
-        print(f'  serialhnd.mat not found at {serialhnd_file}, skipping')
+    # ---- Load hand data -----------------------------------------------------
+    # The touchscreen node writes serialhnd.mat even when it was not plugged in,
+    # so an empty topic is a normal outcome, not an error.
+    hnd_msgs = load_bag_topic(bag_dir, 'serialhnd.mat', 'serialhnd')
+    if hnd_msgs is None:
+        print('  No touchscreen data present, skipping')
         return
 
-    # ---- Load hand data -----------------------------------------------------
-    hnd_mat = loadmat(serialhnd_file, simplify_cells=True)
-    hnd_msgs = hnd_mat.get('serialhnd', hnd_mat)
-
-    if not hnd_msgs or not (isinstance(hnd_msgs, dict) and hnd_msgs):
-        print('  No hand data present, skipping')
+    required = ('header_stamp_sec', 'header_stamp_nanosec', 'x', 'y')
+    missing = [k for k in required if k not in hnd_msgs]
+    if missing:
+        print(f'  serialhnd.mat missing fields {missing}, skipping')
         return
 
     t_hand_header = (np.asarray(hnd_msgs['header_stamp_sec'], dtype=float).ravel()
@@ -42,6 +44,10 @@ def proc_hand(day, rec, monkeydir, out_suffix=''):
         np.asarray(hnd_msgs['x'], dtype=float).ravel(),
         np.asarray(hnd_msgs['y'], dtype=float).ravel()
     ])  # 2 × n_hand_samples
+
+    if hand.shape[1] == 0 or len(t_hand_header) == 0:
+        print('  No touchscreen samples present, skipping')
+        return
 
     # ---- Recording length / time grid ---------------------------------------
     Fs_rec = get_fs_rec(rec_pref)
