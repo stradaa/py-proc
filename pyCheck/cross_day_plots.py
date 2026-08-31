@@ -451,6 +451,20 @@ def generate_cross_day_plots(
     except Exception as exc:  # noqa: BLE001
         print(f"cross_day_co_structured: skipped ({exc})")
 
+    # Companion Fitts'-law bit-rate/throughput figure (separate file). Guarded:
+    # never let it break the core summary.
+    try:
+        from .fitts_throughput import generate_cross_day_throughput
+
+        throughput = generate_cross_day_throughput(
+            repo_root_path, selections, out_dir_path, task_types
+        )
+        result["throughput_figure_path"] = throughput["figure_path"]
+        result["throughput_metrics_json_path"] = throughput["metrics_json_path"]
+        result["throughput_metrics_csv_path"] = throughput["metrics_csv_path"]
+    except Exception as exc:  # noqa: BLE001
+        print(f"fitts_throughput: skipped ({exc})")
+
     return result
 
 
