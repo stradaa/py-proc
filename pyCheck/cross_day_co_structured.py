@@ -36,12 +36,20 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 
 try:
-    from .co_structured import AttemptRecord, STRUCTURED_PHASES, _collect_rec, _tag_pairs
+    from .co_structured import (
+        AttemptRecord, STRUCTURED_PHASES, _collect_rec, _tag_pairs,
+        assign_ring as _assign_ring, detect_rings as _detect_rings,
+        ring_labels_sorted as _ring_label_sorted,
+    )
     from .cross_day_co_structured_plots import plot_cross_day_co_structured
     from .cross_day_plots import _default_out_dir, _parse_day_rec_selection, _summarize_modes
     from .joystick_validation import load_joystick_dataset
 except ImportError:  # pragma: no cover - script-mode fallback
-    from co_structured import AttemptRecord, STRUCTURED_PHASES, _collect_rec, _tag_pairs
+    from co_structured import (
+        AttemptRecord, STRUCTURED_PHASES, _collect_rec, _tag_pairs,
+        assign_ring as _assign_ring, detect_rings as _detect_rings,
+        ring_labels_sorted as _ring_label_sorted,
+    )
     from cross_day_co_structured_plots import plot_cross_day_co_structured
     from cross_day_plots import _default_out_dir, _parse_day_rec_selection, _summarize_modes
     from joystick_validation import load_joystick_dataset
@@ -66,57 +74,6 @@ def _success_rate(records: Sequence[AttemptRecord]) -> float:
     if not records:
         return float("nan")
     return float(np.mean([r.outcome == "success" for r in records]))
-
-
-# ---------------------------------------------------------------------------
-# Ring detection
-# ---------------------------------------------------------------------------
-
-def _detect_rings(peripheral: Sequence[AttemptRecord], tolerance: float = 0.03) -> List[float]:
-    """Cluster peripheral reach distances into distinct rings.
-
-    Returns sorted list of ring center distances (in norm coords).
-    Single-ring data returns a list with one element.
-    """
-    distances = sorted({
-        round(r.reach_distance, 3)
-        for r in peripheral if np.isfinite(r.reach_distance)
-    })
-    if not distances:
-        return []
-    rings: List[float] = [distances[0]]
-    for d in distances[1:]:
-        if d - rings[-1] > tolerance:
-            rings.append(d)
-        else:
-            # Update ring center to mean of cluster
-            rings[-1] = (rings[-1] + d) / 2.0
-    return rings
-
-
-def _assign_ring(reach_distance: float, rings: List[float]) -> Optional[str]:
-    """Assign a record to the nearest detected ring, returning a label."""
-    if not rings or not np.isfinite(reach_distance):
-        return None
-    idx = int(np.argmin([abs(reach_distance - r) for r in rings]))
-    if len(rings) == 1:
-        return "ring"
-    return f"{'near' if idx == 0 else 'far' if idx == len(rings) - 1 else f'ring{idx}'}"
-
-
-def _ring_label_sorted(rings: List[float]) -> List[str]:
-    """Generate sorted ring labels matching _assign_ring output."""
-    if len(rings) <= 1:
-        return ["ring"]
-    labels = []
-    for i in range(len(rings)):
-        if i == 0:
-            labels.append("near")
-        elif i == len(rings) - 1:
-            labels.append("far")
-        else:
-            labels.append(f"ring{i}")
-    return labels
 
 
 # ---------------------------------------------------------------------------

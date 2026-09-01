@@ -234,9 +234,14 @@ def load_joystick_dataset(repo_root: str | Path, day: str, rec: str = "001") -> 
     # Per-trial re-center points (task_perf_counter clock == joystick_task_s),
     # so the stateful modes reset exactly where the task did.
     trial_start_times_s = _extract_trial_start_times_s(behav_results)
+    # The task logs its own cursor on every target_entry/hold_start/target_exit;
+    # without them the stateful modes free-integrate and drift without bound.
+    cursor_anchors = _extract_cursor_anchors(behav_results)
     cursor_x, cursor_y = reconstruct_cursor(
-        joystick_x, joystick_y, joystick_task_s, ref_cfg, trial_start_times_s
+        joystick_x, joystick_y, joystick_task_s, ref_cfg, trial_start_times_s,
+        cursor_anchors,
     )
+    _report_cursor_anchor_fit(day, rec, cursor_anchors, control_mode)
 
     return JoystickDataset(
         root=root,
@@ -289,6 +294,69 @@ def _extract_trial_start_times_s(behav_results: List[Dict[str, Any]]) -> List[fl
             if ev is not None and "time_perf_counter" in ev:
                 starts.append(float(ev["time_perf_counter"]))
     return sorted(starts)
+
+
+def _extract_cursor_anchors(
+    behav_results: List[Dict[str, Any]]
+) -> List[Tuple[float, float, float]]:
+    """``(time_perf_counter, cursor_x, cursor_y)`` for every attempt event that
+    carries the task's own cursor position, sorted by time.
+
+    These are ground truth: the Rust task stamps its live cursor onto
+    ``target_entry`` / ``hold_start`` / ``target_exit`` events. They anchor the
+    offline integration in ``reconstruct_cursor``.
+    """
+    anchors: List[Tuple[float, float, float]] = []
+    for result in behav_results:
+        if not isinstance(result, dict):
+            continue
+        for attempt in result.get("attempts", []):
+            if not isinstance(attempt, dict):
+                continue
+            for event in attempt.get("events", []):
+                if not isinstance(event, dict) or "cursor_x" not in event:
+                    continue
+                try:
+                    anchors.append((
+                        float(event["time_perf_counter"]),
+                        float(event["cursor_x"]),
+                        float(event["cursor_y"]),
+                    ))
+                except (KeyError, TypeError, ValueError):
+                    continue
+    anchors.sort()
+    return anchors
+
+
+def _report_cursor_anchor_fit(
+    day: str,
+    rec: str,
+    anchors: Sequence[Tuple[float, float, float]],
+    control_mode: str,
+) -> None:
+    """One line on anchor coverage.
+
+    The corrected trace passes through every anchor exactly, so the residual at
+    the anchors is not a fit statistic. What actually bounds the error is how
+    long the integration runs unconstrained between them.
+    """
+    stateful = control_mode in ("cumulative", "blend")
+    if not anchors:
+        if stateful:
+            print(
+                f"[joystick_validation] WARNING {day}/{rec}: control_mode={control_mode} "
+                f"but no logged cursor anchors; the integration is unconstrained and "
+                f"will drift over the rec."
+            )
+        return
+    times = np.asarray(anchors, dtype=float)[:, 0]
+    gaps = np.diff(times)
+    span = times[-1] - times[0]
+    print(
+        f"[joystick_validation] {day}/{rec}: {len(times)} cursor anchors over {span:.0f}s, "
+        f"gap median={np.median(gaps):.2f}s p90={np.percentile(gaps, 90):.2f}s "
+        f"max={gaps.max():.2f}s"
+    )
 
 
 def open_camera_readers(
@@ -418,6 +486,7 @@ def reconstruct_cursor(
     task_time_s: np.ndarray,
     task_config: Dict[str, Any],
     trial_start_times_s: Sequence[float] = (),
+    cursor_anchors: Sequence[Tuple[float, float, float]] = (),
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstruct the normalized cursor from joystick (direct/cumulative/blend).
 
@@ -425,10 +494,12 @@ def reconstruct_cursor(
     the replay overlay stay identical. ``trial_start_times_s`` (in the same
     clock as ``task_time_s``) are the per-trial re-center points honored by the
     stateful modes when ``reset_cursor_each_trial`` is set; pass none to keep the
-    legacy single-reset behavior.
+    legacy single-reset behavior. ``cursor_anchors`` are ``(time_s, x, y)``
+    triples of the task's own logged cursor, used to remove integration drift.
     """
     return _reconstruct_cursor(
-        task_time_s, joystick_x, joystick_y, task_config, trial_start_times_s
+        task_time_s, joystick_x, joystick_y, task_config, trial_start_times_s,
+        cursor_anchors,
     )
 
 
@@ -448,24 +519,33 @@ def get_attempt_segment(
     attempt: Dict[str, Any],
     pre_s: float = 0.15,
     post_s: float = 0.25,
+    end_event: Optional[str] = None,
 ) -> TrialSegment:
     """Cursor/joystick segment for one attempt of a trial.
 
     The Rust task runs many attempts per Thalamus trial; get_trial_segment
     only sees the final one. This accepts any attempt dict from
     behav_result["attempts"].
+
+    The window ends at the attempt's success/fail event. Pass ``end_event``
+    (e.g. ``"hold_complete"``) to cut earlier — a trajectory figure usually
+    wants the transport only, not the in-target hold dwell that follows it.
     """
     alltrial = get_trial_row(dataset.all_trials, trial_index)
     events_task_s = extract_trial_event_times_task_s(dataset, alltrial)
 
     target_on_event = select_attempt_event(attempt, "target_on", "first")
     end_name = "success" if str(attempt.get("outcome", "")).lower() == "success" else "fail"
-    end_event = select_attempt_event(attempt, end_name, "last")
-    if target_on_event is None or end_event is None:
+    end_evt = select_attempt_event(attempt, end_name, "last")
+    if end_event is not None:
+        # Fall back to the outcome event when the requested cut point is absent
+        # (a failed attempt never reaches hold_complete).
+        end_evt = select_attempt_event(attempt, end_event, "first") or end_evt
+    if target_on_event is None or end_evt is None:
         raise ValueError(f"Missing target_on or end event for trial {trial_index + 1}")
 
     t_start = float(target_on_event["time_perf_counter"]) - pre_s
-    t_end = float(end_event["time_perf_counter"]) + post_s
+    t_end = float(end_evt["time_perf_counter"]) + post_s
     mask = (dataset.joystick_task_s >= t_start) & (dataset.joystick_task_s <= t_end)
     if not np.any(mask):
         raise ValueError(f"No joystick samples found for trial {trial_index + 1}")

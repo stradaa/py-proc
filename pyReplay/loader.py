@@ -151,6 +151,38 @@ def _summary_targets(doc: dict):
     return out
 
 
+def _summary_cursor_anchors(doc: dict):
+    """``(t_ns, cursor_x, cursor_y)`` for every attempt event that carries the
+    task's own live cursor (target_entry / hold_start / target_exit).
+
+    These pin the offline reconstruction to what the task actually drew; see
+    ``pyjoystick.cursor.apply_cursor_anchors``.
+    """
+    br = doc.get("behav_result")
+    if not isinstance(br, dict):
+        return []
+    attempts = br.get("attempts") or []
+    if not attempts and isinstance(br.get("final_attempt"), dict):
+        attempts = [br["final_attempt"]]
+
+    out = []
+    for att in attempts:
+        if not isinstance(att, dict):
+            continue
+        for e in att.get("events") or []:
+            if not isinstance(e, dict) or "cursor_x" not in e:
+                continue
+            try:
+                out.append((
+                    int(float(e["time_perf_counter"]) * 1e9),
+                    float(e["cursor_x"]),
+                    float(e["cursor_y"]),
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return out
+
+
 # Colors for trial outcome (target circle tint).
 _OUTCOME_COLOR = {"success": "#4caf50", "fail": "#d62728", "failure": "#d62728"}
 
@@ -249,6 +281,7 @@ def load_window(
 
     events: List[EventMark] = []
     target_intervals: List = []   # (t_on_ns, t_off_ns, x, y, r, outcome) per target
+    cursor_anchors: List = []     # (t_ns, cursor_x, cursor_y) logged by the task
     control_cfg: dict = {}        # task_config used for cursor reconstruction
 
     t0_ns: Optional[int] = None
@@ -312,6 +345,7 @@ def load_window(
                     if not control_cfg:
                         control_cfg = doc["task_config"]
                     target_intervals.extend(_summary_targets(doc))
+                    cursor_anchors.extend(_summary_cursor_anchors(doc))
                 continue
 
             if not in_window or body != "analog":
@@ -371,8 +405,10 @@ def load_window(
     win.center_gate_radius = float(control_cfg.get("center_gate_radius_ratio", 0.0) or 0.0)
 
     # Reconstruct cursor (normalized [0,1]) from joystick for the target overlay.
+    cursor_anchors.sort()
     win.cursor_x, win.cursor_y = cursor_mod.reconstruct(
         win.joystick_t_ns, win.joystick_x, win.joystick_y, control_cfg, trial_starts,
+        cursor_anchors,
     )
 
     nodes = camera_names if camera_names is not None else sorted(cam_frames)

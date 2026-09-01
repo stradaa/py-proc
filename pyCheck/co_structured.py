@@ -6,22 +6,30 @@ with ``schedule_phase``: ``"center"`` / ``"peripheral"`` (center-out mode),
 insert, or a fallback pick). This module separates structured trials from
 random inserts and writes, per day:
 
-- ``<day>_co_structured.png`` — a 3x3 compass grid, one panel per peripheral
-  CO target laid out by true direction, showing successful reach trajectories
-  and their average; the center cell overlays all 8 average trajectories.
-- ``<day>_co_structured_metrics.png`` — success-rate bars (per peripheral
-  target, structured vs random, pair completion), plus median reach duration
-  and path efficiency by direction.
+- ``<day>_co_structured.png`` — a compass grid sized to the day's direction
+  count (8 -> 3x3, 16 -> 5x5), one panel per ``(ring, angle)`` laid out by
+  direction, showing successful reach trajectories and their average; the
+  merged inner block overlays every direction's average.
+- ``<day>_co_structured_metrics.png`` — success-rate bars (per direction,
+  structured vs random, pair completion), plus median reach duration and path
+  efficiency by direction, grouped into one block per ring.
 - ``<day>_co_structured_attempts.csv`` — one row per attempt that carries a
   ``schedule_phase`` (rec, trial, attempt, phase, outcome, target identity,
-  timing, pair tagging, and the row's slice into the NPZ).
+  ring, timing, pair tagging, and the row's slice into the NPZ).
 - ``<day>_co_structured_paths.npz`` — pickle-free ragged path storage:
   concatenated ``task_time_s`` / ``cursor_x`` / ``cursor_y`` / ``joystick_x``
   / ``joystick_y`` with ``row_start`` / ``row_len`` indexed by the CSV's
   ``path_row`` column (``sl = slice(row_start[k], row_start[k] + row_len[k])``).
 
-Pairing caveat: a shared ``pair_id`` is assigned to *adjacent*
-(center, peripheral) attempts. Adjacency is guaranteed only for data recorded
+Cursor caveat: paths come from ``joystick_validation``'s reconstruction, which
+anchors itself to the cursor the task logs on its own events. Without those
+anchors the stateful control modes drift far enough that reaches miss their
+targets entirely — see ``pyjoystick.cursor.apply_cursor_anchors``.
+
+Pairing caveat: a shared ``pair_id`` is assigned to attempts *adjacent in the
+rec's attempt sequence*, not within a Thalamus trial (the center hold and the
+reach it gates are usually two attempts in two trials). Adjacency is
+guaranteed only for data recorded
 with the pair-boundary executor build (>= 2026-07-07); in older recordings a
 random insert could land inside a pair, which simply leaves those attempts
 unpaired here.
@@ -36,7 +44,7 @@ import argparse
 import csv
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -50,13 +58,9 @@ from pyCheck.joystick_validation import (
 
 STRUCTURED_PHASES = ("center", "peripheral", "sequence")
 
-# Vega category10 minus the grays reserved for random inserts.
-TARGET_PALETTE = [
-    "#4c78a8", "#f58518", "#e45756", "#72b7b2", "#54a24b",
-    "#eeca3b", "#b279a2", "#ff9da6", "#9d755d", "#6b4c9a",
-]
+# Peripheral targets get a hue-by-angle palette (co_structured_directions), so
+# only the non-directional categories need a fixed color.
 RANDOM_COLOR = "#8a8a8a"
-CENTER_COLOR = "#4c6a92"
 
 
 @dataclass
@@ -82,6 +86,7 @@ class AttemptRecord:
     target_angle_deg: float = np.nan
     t_hold_complete: float = np.nan
     reach_distance: float = np.nan
+    ring_label: str = ""
     path_efficiency: float = np.nan
     path: Optional[Dict[str, np.ndarray]] = field(default=None, repr=False)
 
@@ -118,6 +123,66 @@ def _target_angle_deg(target_x: float, target_y: float) -> float:
     if not (np.isfinite(target_x) and np.isfinite(target_y)):
         return float(np.nan)
     return float(np.degrees(np.arctan2(target_y - 0.5, target_x - 0.5)) % 360.0)
+
+
+def detect_rings(peripheral: Sequence["AttemptRecord"], tolerance: float = 0.03) -> List[float]:
+    """Cluster peripheral reach distances into distinct rings.
+
+    Returns sorted list of ring center distances (in norm coords).
+    Single-ring data returns a list with one element.
+    """
+    distances = sorted({
+        round(r.reach_distance, 3)
+        for r in peripheral if np.isfinite(r.reach_distance)
+    })
+    if not distances:
+        return []
+    rings: List[float] = [distances[0]]
+    for d in distances[1:]:
+        if d - rings[-1] > tolerance:
+            rings.append(d)
+        else:
+            # Update ring center to mean of cluster
+            rings[-1] = (rings[-1] + d) / 2.0
+    return rings
+
+
+def assign_ring(reach_distance: float, rings: List[float]) -> Optional[str]:
+    """Assign a record to the nearest detected ring, returning a label."""
+    if not rings or not np.isfinite(reach_distance):
+        return None
+    idx = int(np.argmin([abs(reach_distance - r) for r in rings]))
+    if len(rings) == 1:
+        return "ring"
+    return f"{'near' if idx == 0 else 'far' if idx == len(rings) - 1 else f'ring{idx}'}"
+
+
+def ring_labels_sorted(rings: List[float]) -> List[str]:
+    """Ring labels in ascending-distance order, matching assign_ring output."""
+    if len(rings) <= 1:
+        return ["ring"]
+    labels = []
+    for i in range(len(rings)):
+        if i == 0:
+            labels.append("near")
+        elif i == len(rings) - 1:
+            labels.append("far")
+        else:
+            labels.append(f"ring{i}")
+    return labels
+
+
+def tag_rings(records: List["AttemptRecord"], tolerance: float = 0.03) -> List[float]:
+    """Detect the day's rings over every peripheral record and label each one.
+
+    Rings must be detected across the whole day, not per rec: a rec that only
+    sampled one ring would otherwise collapse both into a single cluster.
+    """
+    peripheral = [r for r in records if r.schedule_phase == "peripheral"]
+    rings = detect_rings(peripheral, tolerance)
+    for record in peripheral:
+        record.ring_label = assign_ring(record.reach_distance, rings) or ""
+    return rings
 
 
 def _attempt_times(attempt: Dict[str, Any]) -> tuple:
@@ -172,7 +237,12 @@ def _collect_rec(dataset: JoystickDataset, day: str, rec: int) -> List[AttemptRe
                 record.target_angle_deg = _target_angle_deg(target_x, target_y)
                 record.reach_distance = float(np.hypot(target_x - 0.5, target_y - 0.5))
             try:
-                segment = get_attempt_segment(dataset, trial_index, attempt)
+                # Transport only: no padding, cut at acquisition. Keeps the
+                # drawn path on the same interval as path_efficiency below.
+                segment = get_attempt_segment(
+                    dataset, trial_index, attempt,
+                    pre_s=0.0, post_s=0.0, end_event="hold_complete",
+                )
                 record.path = {
                     "task_time_s": np.asarray(segment.task_time_s, dtype=float),
                     "cursor_x": np.asarray(segment.cursor_x, dtype=float),
@@ -197,18 +267,23 @@ def _collect_rec(dataset: JoystickDataset, day: str, rec: int) -> List[AttemptRe
 
 
 def _tag_pairs(records: List[AttemptRecord], next_pair_id: int) -> int:
-    """Assign pair_id to adjacent (center, peripheral) attempts per trial."""
-    by_trial: Dict[tuple, List[AttemptRecord]] = {}
-    for record in records:
-        by_trial.setdefault((record.rec, record.trial_index), []).append(record)
-    for trial_records in by_trial.values():
-        for a, b in zip(trial_records, trial_records[1:]):
-            if a.schedule_phase == "center" and b.schedule_phase == "peripheral":
-                a.pair_id = b.pair_id = next_pair_id
-                a.pair_complete = b.pair_complete = (
-                    a.outcome == "success" and b.outcome == "success"
-                )
-                next_pair_id += 1
+    """Assign pair_id to consecutive (center, peripheral) attempts within a rec.
+
+    The center hold and the peripheral reach it gates are two attempts, and the
+    executor may place them in *different* Thalamus trials (one attempt per
+    trial is the common case), so adjacency has to be judged over the rec's
+    attempt sequence rather than within a trial.
+    """
+    ordered = sorted(records, key=lambda r: (r.rec, r.trial_index, r.attempt_index))
+    for a, b in zip(ordered, ordered[1:]):
+        if a.rec != b.rec:
+            continue
+        if a.schedule_phase == "center" and b.schedule_phase == "peripheral":
+            a.pair_id = b.pair_id = next_pair_id
+            a.pair_complete = b.pair_complete = (
+                a.outcome == "success" and b.outcome == "success"
+            )
+            next_pair_id += 1
     return next_pair_id
 
 
@@ -218,7 +293,7 @@ def _write_csv(records: List[AttemptRecord], out_path: Path) -> None:
         "outcome", "failure_reason", "target_index", "target_name",
         "target_x", "target_y", "target_radius", "target_angle_deg",
         "t_target_on", "t_end", "t_hold_complete", "duration_s", "reach_distance",
-        "path_efficiency", "pair_id", "pair_complete", "path_row",
+        "ring_label", "path_efficiency", "pair_id", "pair_complete", "path_row",
     ]
     with open(out_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
@@ -230,7 +305,7 @@ def _write_csv(records: List[AttemptRecord], out_path: Path) -> None:
                 record.target_index, record.target_name,
                 record.target_x, record.target_y, record.target_radius, record.target_angle_deg,
                 record.t_target_on, record.t_end, record.t_hold_complete, record.duration_s,
-                record.reach_distance, record.path_efficiency,
+                record.reach_distance, record.ring_label, record.path_efficiency,
                 record.pair_id, int(record.pair_complete), record.path_row,
             ])
     print(f"Saved attempt table: {out_path}")
@@ -286,6 +361,7 @@ def generate_co_structured_outputs(
     recs_used: List[int] = []
     recs_skipped: List[int] = []
     next_pair_id = 0
+    ref_task_config: Optional[Dict[str, Any]] = None
     for rec in _rec_numbers(day_dir):
         if rec in exclude_recs:
             continue
@@ -299,6 +375,8 @@ def generate_co_structured_outputs(
             print(f"co_structured: rec{rec:03d} failed to load ({exc}), skipping")
             recs_skipped.append(rec)
             continue
+        if ref_task_config is None and dataset.task_configs:
+            ref_task_config = dataset.task_configs[0]
         rec_records = _collect_rec(dataset, day, rec)
         next_pair_id = _tag_pairs(rec_records, next_pair_id)
         records.extend(rec_records)
@@ -308,23 +386,28 @@ def generate_co_structured_outputs(
         print("co_structured: no schedule_phase data found for this day, skipping")
         return {"skipped": "no schedule_phase data"}
 
+    rings = tag_rings(records)
+    if len(rings) > 1:
+        print(f"co_structured: {len(rings)} rings detected at distances "
+              f"{', '.join(f'{r:.3f}' for r in rings)}")
+
     out_dir_path.mkdir(parents=True, exist_ok=True)
     _write_npz(records, out_dir_path / f"{day}_co_structured_paths.npz")
     _write_csv(records, out_dir_path / f"{day}_co_structured_attempts.csv")
 
     # Local import: co_structured_plots imports AttemptRecord/palette constants
     # back from this module, so a top-level import here would be circular.
-    from pyCheck.co_structured_plots import (
-        plot_co_structured_metrics,
-        plot_co_structured_trajectories,
-    )
+    from pyCheck.co_structured_plots import plot_co_structured_metrics
+    from pyCheck.co_structured_traj_plots import plot_co_structured_trajectories
 
     metrics = plot_co_structured_metrics(
         records, out_dir_path / f"{day}_co_structured_metrics.png", day, exclude_recs
     )
     metrics["trajectories"] = plot_co_structured_trajectories(
-        records, out_dir_path / f"{day}_co_structured.png", day, exclude_recs
+        records, out_dir_path / f"{day}_co_structured.png", day, exclude_recs,
+        task_config=ref_task_config,
     )
+    metrics["rings"] = rings
     metrics["recs_used"] = recs_used
     metrics["recs_skipped"] = recs_skipped
     return metrics

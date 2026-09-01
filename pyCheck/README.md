@@ -23,11 +23,11 @@ Tools in this folder:
   already in `AllTrials.mat`: `*_kinematic_intervals.png` (reaction / movement / hold-duration histograms),
   `*_failure_modes.png` (why failed trials failed, per rec), `*_overshoot_attempts.png` (target re-entry rate and
   attempts per trial), and `*_engagement.png` (inter-trial interval, cumulative trials vs rewards, trial rate per rec).
-- `co_structured.py` / `co_structured_plots.py`
+- `co_structured.py` / `co_structured_traj_plots.py` / `co_structured_plots.py`
   Structured center-out (CO) outputs for days recorded with the Rust executor's target schedule: separates
   `schedule_phase`-tagged attempts (`center` / `peripheral` / `sequence` vs `random` inserts), writes
-  `*_co_structured.png` (per-target compass trajectory grid), `*_co_structured_metrics.png` (performance /
-  speed / path-efficiency bars by direction), `*_co_structured_attempts.csv` (one row per attempt),
+  `*_co_structured.png` (per-direction compass trajectory grid), `*_co_structured_metrics.png` (performance /
+  speed / path-efficiency bars by direction and ring), `*_co_structured_attempts.csv` (one row per attempt),
   and `*_co_structured_paths.npz` (full cursor/joystick paths). Runs automatically inside
   `generate_day_presentation_plots` (skipped when a day has no `schedule_phase` data) or standalone via
   `python -m pyCheck.co_structured` with the same `--repo-root/--day/--day-dir/--out-dir/--exclude-recs` args.
@@ -212,13 +212,20 @@ picks). It reads attempts straight from `recNNN.ev.mat` `behav_results` — no p
 schema change — and reconstructs each attempt's cursor path from `joystick.mat`.
 
 Outputs (same `claude/figures/<day>/beh` folder):
-- **`<day>_co_structured.png`** — a 3x3 compass grid, one panel per peripheral CO target laid out by true
-  direction (e.g. the 90° target's panel is top-middle, 0° is middle-right), each showing every successful
-  reach to that target (thin, translucent) plus one bold average trajectory (per-trial cursor paths resampled
-  onto a common normalized-time grid and averaged). Reaches end right at target acquisition — the return leg
-  is a separate `center`-phase attempt and isn't drawn here. The center grid cell overlays all 8 average
-  trajectories for a quick direction comparison.
-- **`<day>_co_structured_metrics.png`** — three bar-chart panels, x-axis ordered by angle (0°→315°):
+- **`<day>_co_structured.png`** — a compass grid sized to the number of directions the day ran: 8 directions
+  give a 3x3, 16 give a 5x5, 24 give a 7x7 (grid size `G` is the smallest odd number whose `4(G-1)` perimeter
+  cells fit every direction). Each perimeter panel sits at its own direction (the 90° target's panel is
+  top-middle, 0° is middle-right), and shows every successful reach to that target (thin, translucent) plus
+  one bold average trajectory (per-trial cursor paths resampled onto a common normalized-time grid and
+  averaged). Panels are keyed by `(ring, angle)`, so a two-ring day gets one panel per ring per direction and
+  never averages a near reach together with a far one; hue carries direction and the outer ring is darker.
+  Reaches are drawn `target_on` → `hold_complete` — transport only. The return leg is a separate
+  `center`-phase attempt and isn't drawn here. The merged inner block overlays every direction's average.
+  Targets are drawn as **ellipses**: `target_radius_ratio` scales by the task region's *min* dimension, so a
+  target that is a circle on screen is an ellipse in the normalized coordinates this figure plots in (see
+  `fitts_throughput.pixel_scale`). The dotted ellipse at center is `center_gate_radius_ratio`.
+- **`<day>_co_structured_metrics.png`** — three bar-chart panels, directions ordered by angle and grouped into
+  one contiguous block per ring (labelled `near` / `far` when a day ran more than one):
   (1) success rate per peripheral target / structured vs random overall / center→peripheral pair completion,
   (2) median reach duration by direction (successful attempts only), and (3) median path efficiency by
   direction (successful attempts only; actual path length / straight-line distance from `target_on` to
@@ -228,12 +235,13 @@ Outputs (same `claude/figures/<day>/beh` folder):
 - **`<day>_co_structured_attempts.csv`** — one row per `schedule_phase` attempt:
   `day, rec, trial_index, attempt_index, schedule_phase, outcome, failure_reason, target_index, target_name,
   target_x, target_y, target_radius, target_angle_deg, t_target_on, t_end, t_hold_complete, duration_s,
-  path_efficiency, pair_id, pair_complete, path_row`.
+  reach_distance, ring_label, path_efficiency, pair_id, pair_complete, path_row`.
   `target_angle_deg` is the target's true angle from center (0.5, 0.5) in degrees [0, 360), derived
   geometrically (never from `target_name`, which is an arbitrary experimenter string) — populated only for
-  `schedule_phase == "peripheral"` (NaN otherwise). `path_efficiency` is populated only for successful
-  peripheral attempts. `pair_id >= 0` groups an adjacent center→peripheral pair; `path_row` indexes into the
-  NPZ (−1 = no path).
+  `schedule_phase == "peripheral"` (NaN otherwise). `reach_distance` is the target's normalized distance from
+  center and `ring_label` its detected ring (`ring` for a single-ring day, else `near` / `ring<i>` / `far`),
+  both peripheral-only. `path_efficiency` is populated only for successful peripheral attempts. `pair_id >= 0`
+  groups an adjacent center→peripheral pair; `path_row` indexes into the NPZ (−1 = no path).
 - **`<day>_co_structured_paths.npz`** — pickle-free ragged path storage: concatenated `task_time_s`,
   `cursor_x`, `cursor_y`, `joystick_x`, `joystick_y` plus `row_start` / `row_len`. Reconstruct row `k` with
   `sl = slice(row_start[k], row_start[k] + row_len[k])`, e.g.:
@@ -251,6 +259,14 @@ Outputs (same `claude/figures/<day>/beh` folder):
 Notes:
 - Pair adjacency (`pair_id`) is guaranteed only for data recorded with the pair-boundary executor build
   (≥ 2026-07-07); in older recordings a random insert could land inside a pair, leaving those attempts unpaired.
+  Pairing runs over the rec's attempt sequence, not within a Thalamus trial — the center hold and the reach it
+  gates are commonly two attempts in two different trials.
+- The `cursor_x` / `cursor_y` in the NPZ are reconstructed from `joystick.mat`, then **anchored** to the
+  cursor the task itself logs on its `target_entry` / `hold_start` / `target_exit` events. Under the stateful
+  control modes (`cumulative` / `blend`) the offline integration otherwise drifts without bound — on 260901
+  it reached 0.38 in normalized units, four times a target radius, and only 43% of successful peripheral
+  reaches ended inside their target. With anchoring that is 98%. `load_joystick_dataset` prints the anchor
+  coverage per rec and warns when a stateful rec has no anchors at all.
 - The schedule advances per *presented* trial, not per success — filter on `outcome == "success"` (or
   `pair_complete`) for completed reaches.
 - Attempts without a `schedule_phase` key (pure-Python task, pre-schedule days) are ignored; if the whole day

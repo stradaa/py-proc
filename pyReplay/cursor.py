@@ -22,10 +22,19 @@ def reconstruct(
     joystick_y: np.ndarray,
     cfg: Dict,
     trial_starts_ns: Sequence[int] = (),
+    cursor_anchors_ns: Sequence[Tuple[int, float, float]] = (),
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Return (cursor_x, cursor_y) in [0,1], aligned to joystick samples."""
+    """Return (cursor_x, cursor_y) in [0,1], aligned to joystick samples.
+
+    ``cursor_anchors_ns`` are ``(t_ns, cursor_x, cursor_y)`` triples of the
+    cursor the task itself logged. Without them the stateful control modes
+    integrate unconstrained and the overlay drifts off the targets.
+    """
     if len(joystick_x) == 0:
         return np.empty(0), np.empty(0)
     t_s = np.asarray(joystick_t_ns, dtype=float) / 1e9
     trial_start_times_s = [float(s) / 1e9 for s in trial_starts_ns]
-    return reconstruct_cursor(t_s, joystick_x, joystick_y, cfg, trial_start_times_s)
+    anchors = [(float(t) / 1e9, float(x), float(y)) for t, x, y in cursor_anchors_ns]
+    return reconstruct_cursor(
+        t_s, joystick_x, joystick_y, cfg, trial_start_times_s, anchors
+    )
