@@ -13,11 +13,16 @@ Per-day aggregation reuses `co_structured.py`'s attempt collection
 raw `joystick.mat`/`recNNN.ev.mat`, so this works independently of whether
 `co_structured.py`'s own per-day figures have been generated for that day.
 
+Ring support: when multiple CO ring distances are present (e.g. a near ring
+and a far ring), metrics are split per ring.  Backward-compatible: single-ring
+data produces the same output as before, just with one ring label.
+
 Metrics per day (medians/rates across the selected recs' peripheral attempts):
   * Structured vs random success rate.
   * Median reach duration and path efficiency (successful peripheral only).
   * Center→peripheral pair completion rate.
-  * Direction-resolved success rate (day x angle), for the heatmap panel.
+  * Direction-resolved success rate, speed, and path efficiency
+    (day × ring × angle), for the heatmap panels.
 """
 
 from __future__ import annotations
@@ -63,6 +68,129 @@ def _success_rate(records: Sequence[AttemptRecord]) -> float:
     return float(np.mean([r.outcome == "success" for r in records]))
 
 
+# ---------------------------------------------------------------------------
+# Ring detection
+# ---------------------------------------------------------------------------
+
+def _detect_rings(peripheral: Sequence[AttemptRecord], tolerance: float = 0.03) -> List[float]:
+    """Cluster peripheral reach distances into distinct rings.
+
+    Returns sorted list of ring center distances (in norm coords).
+    Single-ring data returns a list with one element.
+    """
+    distances = sorted({
+        round(r.reach_distance, 3)
+        for r in peripheral if np.isfinite(r.reach_distance)
+    })
+    if not distances:
+        return []
+    rings: List[float] = [distances[0]]
+    for d in distances[1:]:
+        if d - rings[-1] > tolerance:
+            rings.append(d)
+        else:
+            # Update ring center to mean of cluster
+            rings[-1] = (rings[-1] + d) / 2.0
+    return rings
+
+
+def _assign_ring(reach_distance: float, rings: List[float]) -> Optional[str]:
+    """Assign a record to the nearest detected ring, returning a label."""
+    if not rings or not np.isfinite(reach_distance):
+        return None
+    idx = int(np.argmin([abs(reach_distance - r) for r in rings]))
+    if len(rings) == 1:
+        return "ring"
+    return f"{'near' if idx == 0 else 'far' if idx == len(rings) - 1 else f'ring{idx}'}"
+
+
+def _ring_label_sorted(rings: List[float]) -> List[str]:
+    """Generate sorted ring labels matching _assign_ring output."""
+    if len(rings) <= 1:
+        return ["ring"]
+    labels = []
+    for i in range(len(rings)):
+        if i == 0:
+            labels.append("near")
+        elif i == len(rings) - 1:
+            labels.append("far")
+        else:
+            labels.append(f"ring{i}")
+    return labels
+
+
+# ---------------------------------------------------------------------------
+# Per-direction, per-ring metrics
+# ---------------------------------------------------------------------------
+
+def _direction_ring_metrics(
+    peripheral: Sequence[AttemptRecord], rings: List[float],
+) -> Dict[str, Any]:
+    """Compute direction × ring metrics: success rate, median speed, median path efficiency."""
+    ring_labels = _ring_label_sorted(rings)
+    angles = sorted({
+        int(round(r.target_angle_deg)) % 360
+        for r in peripheral if np.isfinite(r.target_angle_deg)
+    })
+
+    # Per ring: {ring_label: {angle_str: value}}
+    dir_success: Dict[str, Dict[str, float]] = {rl: {} for rl in ring_labels}
+    dir_speed: Dict[str, Dict[str, float]] = {rl: {} for rl in ring_labels}
+    dir_path_eff: Dict[str, Dict[str, float]] = {rl: {} for rl in ring_labels}
+    dir_n: Dict[str, Dict[str, int]] = {rl: {} for rl in ring_labels}
+
+    for angle in angles:
+        for rl in ring_labels:
+            group = [
+                r for r in peripheral
+                if (np.isfinite(r.target_angle_deg)
+                    and int(round(r.target_angle_deg)) % 360 == angle
+                    and _assign_ring(r.reach_distance, rings) == rl)
+            ]
+            if not group:
+                continue
+            dir_success[rl][str(angle)] = _success_rate(group)
+            dir_n[rl][str(angle)] = len(group)
+            successful = [r for r in group if r.outcome == "success"]
+            dir_speed[rl][str(angle)] = _median([r.duration_s for r in successful])
+            dir_path_eff[rl][str(angle)] = _median([r.path_efficiency for r in successful])
+
+    return {
+        "ring_labels": ring_labels,
+        "ring_distances": [round(r, 4) for r in rings],
+        "dir_success": dir_success,
+        "dir_speed": dir_speed,
+        "dir_path_eff": dir_path_eff,
+        "dir_n": dir_n,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Per-ring scalar metrics
+# ---------------------------------------------------------------------------
+
+def _per_ring_scalars(
+    peripheral: Sequence[AttemptRecord], rings: List[float],
+) -> Dict[str, Dict[str, Any]]:
+    """Per-ring success rate, median speed, median path efficiency."""
+    ring_labels = _ring_label_sorted(rings)
+    result: Dict[str, Dict[str, Any]] = {}
+    for rl in ring_labels:
+        group = [r for r in peripheral if _assign_ring(r.reach_distance, rings) == rl]
+        successful = [r for r in group if r.outcome == "success"]
+        result[rl] = {
+            "n_attempts": len(group),
+            "success_rate": _success_rate(group),
+            "median_duration_s": _median([r.duration_s for r in successful]),
+            "median_path_efficiency": _median([r.path_efficiency for r in successful]),
+        }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Day-level aggregation
+# ---------------------------------------------------------------------------
+
 def build_day_co_structured(repo_root: Path, day: str, recs: Sequence[int]) -> Dict[str, Any]:
     records: List[AttemptRecord] = []
     next_pair_id = 0
@@ -90,8 +218,14 @@ def build_day_co_structured(repo_root: Path, day: str, recs: Sequence[int]) -> D
     pairs = {r.pair_id for r in records if r.pair_id >= 0}
     complete_pairs = {r.pair_id for r in records if r.pair_id >= 0 and r.pair_complete}
 
-    dir_success: Dict[str, float] = {}
-    dir_n: Dict[str, int] = {}
+    # Ring detection and per-ring metrics
+    rings = _detect_rings(peripheral)
+    dir_metrics = _direction_ring_metrics(peripheral, rings)
+    ring_scalars = _per_ring_scalars(peripheral, rings)
+
+    # Backward-compatible flat dir_success/dir_n (collapsed across rings)
+    flat_dir_success: Dict[str, float] = {}
+    flat_dir_n: Dict[str, int] = {}
     angles = sorted({
         int(round(r.target_angle_deg)) % 360
         for r in peripheral if np.isfinite(r.target_angle_deg)
@@ -101,8 +235,8 @@ def build_day_co_structured(repo_root: Path, day: str, recs: Sequence[int]) -> D
             r for r in peripheral
             if np.isfinite(r.target_angle_deg) and int(round(r.target_angle_deg)) % 360 == angle
         ]
-        dir_success[str(angle)] = _success_rate(group)
-        dir_n[str(angle)] = len(group)
+        flat_dir_success[str(angle)] = _success_rate(group)
+        flat_dir_n[str(angle)] = len(group)
 
     control_mode_label, blend_repr, mode_mixed = _summarize_modes(control_modes, blend_values)
     return {
@@ -121,8 +255,17 @@ def build_day_co_structured(repo_root: Path, day: str, recs: Sequence[int]) -> D
         "n_pairs": len(pairs),
         "n_complete_pairs": len(complete_pairs),
         "pair_completion_rate": (len(complete_pairs) / len(pairs)) if pairs else float("nan"),
-        "dir_success": dir_success,
-        "dir_n": dir_n,
+        # Backward-compatible flat dicts (collapsed across rings)
+        "dir_success": flat_dir_success,
+        "dir_n": flat_dir_n,
+        # Ring-aware metrics
+        "ring_labels": dir_metrics["ring_labels"],
+        "ring_distances": dir_metrics["ring_distances"],
+        "ring_scalars": ring_scalars,
+        "ring_dir_success": dir_metrics["dir_success"],
+        "ring_dir_speed": dir_metrics["dir_speed"],
+        "ring_dir_path_eff": dir_metrics["dir_path_eff"],
+        "ring_dir_n": dir_metrics["dir_n"],
     }
 
 

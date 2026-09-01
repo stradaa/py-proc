@@ -81,6 +81,7 @@ class AttemptRecord:
     path_row: int = -1
     target_angle_deg: float = np.nan
     t_hold_complete: float = np.nan
+    reach_distance: float = np.nan
     path_efficiency: float = np.nan
     path: Optional[Dict[str, np.ndarray]] = field(default=None, repr=False)
 
@@ -169,6 +170,7 @@ def _collect_rec(dataset: JoystickDataset, day: str, rec: int) -> List[AttemptRe
             )
             if phase == "peripheral":
                 record.target_angle_deg = _target_angle_deg(target_x, target_y)
+                record.reach_distance = float(np.hypot(target_x - 0.5, target_y - 0.5))
             try:
                 segment = get_attempt_segment(dataset, trial_index, attempt)
                 record.path = {
@@ -215,8 +217,8 @@ def _write_csv(records: List[AttemptRecord], out_path: Path) -> None:
         "day", "rec", "trial_index", "attempt_index", "schedule_phase",
         "outcome", "failure_reason", "target_index", "target_name",
         "target_x", "target_y", "target_radius", "target_angle_deg",
-        "t_target_on", "t_end", "t_hold_complete", "duration_s", "path_efficiency",
-        "pair_id", "pair_complete", "path_row",
+        "t_target_on", "t_end", "t_hold_complete", "duration_s", "reach_distance",
+        "path_efficiency", "pair_id", "pair_complete", "path_row",
     ]
     with open(out_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
@@ -228,7 +230,7 @@ def _write_csv(records: List[AttemptRecord], out_path: Path) -> None:
                 record.target_index, record.target_name,
                 record.target_x, record.target_y, record.target_radius, record.target_angle_deg,
                 record.t_target_on, record.t_end, record.t_hold_complete, record.duration_s,
-                record.path_efficiency,
+                record.reach_distance, record.path_efficiency,
                 record.pair_id, int(record.pair_complete), record.path_row,
             ])
     print(f"Saved attempt table: {out_path}")
