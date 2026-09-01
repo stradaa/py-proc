@@ -71,16 +71,14 @@ def _safe(failures: list[str], what: str, fn, *fn_args, **fn_kwargs) -> bool:
 _ALL_STEPS = frozenset({"extract", "events_nodisplay", "detect_display", "full_proc", "save_trials", "aruco_calib"})
 
 
-def _run_aruco_calib(repo_root: Path, day_dir: Path, recs: list[str], *, make_plots: bool) -> None:
+def run_aruco_calib(day_dir, recs, *, make_plots: bool = True) -> None:
     """Run the pyPose ArUco calibration per rec (independent of trial count).
 
-    pyPose lives at the actual repo root (parent of this py_proc package dir), so we
-    put that on sys.path before importing. Failures are reported per rec and never
-    abort the rest of the pipeline.
+    Failures are reported per rec and never abort the caller, so a day where one
+    recording lacks a usable board still calibrates the rest. Also reusable from
+    the alexrig Airflow DAG.
     """
-    repo_top = repo_root.parent
-    if str(repo_top) not in sys.path:
-        sys.path.insert(0, str(repo_top))
+    day_dir = Path(day_dir)
     try:
         from pyPose.run_calibration import aruco_calibrate_rec
     except Exception as exc:  # noqa: BLE001
@@ -191,7 +189,7 @@ def run_day_pipeline(
 
     if "aruco_calib" in run_steps:
         print(f"\n=== Step: ArUco 3-camera calibration ===")
-        _run_aruco_calib(repo_root, day_dir, recs, make_plots=aruco_plots)
+        run_aruco_calib(day_dir, recs, make_plots=aruco_plots)
 
     if "save_trials" in run_steps:
         print(f"\n=== Step 5: Aggregate trials ===")

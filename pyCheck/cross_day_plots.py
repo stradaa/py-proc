@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from scipy.io import loadmat
 
+from py_proc.helpers import parse_rec_spec
+
 try:
     from .joystick_validation import _get_final_attempt, get_trial_row, load_joystick_dataset, select_attempt_event
 except ImportError:
@@ -34,24 +36,8 @@ def _flat(data: Dict[str, np.ndarray], key: str, dtype=float) -> np.ndarray:
     return value.astype(dtype)
 
 
-def _parse_int_token(token: str) -> List[int]:
-    token = token.strip()
-    if not token:
-        return []
-    if "-" in token:
-        start_s, end_s = token.split("-", 1)
-        start_i = int(start_s)
-        end_i = int(end_s)
-        step = 1 if end_i >= start_i else -1
-        return list(range(start_i, end_i + step, step))
-    return [int(token)]
-
-
 def _parse_rec_spec(spec: str) -> List[int]:
-    recs: List[int] = []
-    for token in spec.split(","):
-        recs.extend(_parse_int_token(token))
-    return sorted(set(recs))
+    return parse_rec_spec(spec)
 
 
 def _discover_recs(repo_root: Path, day: str) -> List[int]:

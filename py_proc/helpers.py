@@ -28,6 +28,27 @@ def get_recs(day_dir):
     return sorted(entries)
 
 
+def parse_rec_spec(spec):
+    """Parse a rec selection like '1,3-5' into a sorted list of ints.
+
+    Shared by the Airflow DAG params and pyCheck's cross-day --day-recs so the
+    two agree on what '3-5' means.  Ranges may run backwards ('5-3').
+    """
+    recs = []
+    for token in str(spec).split(','):
+        token = token.strip()
+        if not token:
+            continue
+        if '-' in token:
+            start_s, end_s = token.split('-', 1)
+            start_i, end_i = int(start_s), int(end_s)
+            step = 1 if end_i >= start_i else -1
+            recs.extend(range(start_i, end_i + step, step))
+        else:
+            recs.append(int(token))
+    return sorted(set(recs))
+
+
 def rec_paths(day, rec, monkeydir):
     """Return (day_dir, rec_dir, rec_pref, bag_dir) for a given day/rec."""
     day_dir = os.path.join(monkeydir, day)

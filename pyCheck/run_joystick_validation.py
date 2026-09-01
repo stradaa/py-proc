@@ -2,7 +2,7 @@ from pathlib import Path
 import argparse
 import json
 
-from joystick_validation import (
+from pyCheck.joystick_validation import (
     build_validation_report,
     parse_trial_tokens,
     render_trial_replay_video,

@@ -1,20 +1,28 @@
 [project]
 name = "py_proc_alexrig"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
     "av>=17.1.0",  # py_proc/video_remux: lossless camera MP4 remux with true PTS
+    "numpy",
+    "scipy",
+    "matplotlib",  # pyCheck plotting
+    "PyYAML",
 ]
+# thalamus is a runtime requirement of py_proc but is deliberately not declared:
+# the deploy image installs it as `thalamus-neuro @ git+.../Thalamus.git@devel-no-native`
+# and a second direct reference here would be a version-conflict hazard.
+
+[project.optional-dependencies]
+pose = ["opencv-contrib-python"]  # pyPose ArUco, pyCheck.joystick_validation
+gui = ["PyQt6"]                   # proc_gui only
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.build]
-include = ["py_proc/*"]
-
 [tool.hatch.build.targets.wheel]
-packages = ["py_proc"]
+packages = ["py_proc", "pyCheck", "pyPose", "pyReplay", "pyjoystick"]
+exclude = ["pyCheck/output"]
 
 [tool.hatch.build.targets.sdist]
-exclude = ["*venv*"]
-
+exclude = ["*venv*", "proc_gui", "tests", "pyCheck/output"]
