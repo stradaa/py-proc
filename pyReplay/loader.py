@@ -261,8 +261,9 @@ def load_window(
     one is paired with its own record.time; no .avi sidecars or framerates.
 
     target_h caps the retained frame height (frames are downsized to it), and
-    max_fps caps the retained per-camera frame rate — frames closer together
-    than 1/max_fps than the previous kept frame for that camera are dropped.
+    max_fps caps the retained per-camera frame rate — the window is divided into
+    1/max_fps slots and only the first frame landing in each slot is kept, so
+    the kept frames stay evenly spaced whatever the camera's native rate.
     Both bound the RAM held for the whole window (every kept frame stays resident
     for smooth playback); playback and MP4 export both display at 30 fps, so a
     max_fps of ~30 is visually lossless while cutting high-fps cameras several-
@@ -271,6 +272,7 @@ def load_window(
     min_gap_ns = int(1e9 / max_fps) if max_fps and max_fps > 0 else 0
     cam_frames: Dict[str, List[np.ndarray]] = collections.defaultdict(list)
     cam_times: Dict[str, List[int]] = collections.defaultdict(list)
+    cam_slot: Dict[str, int] = {}     # last 1/max_fps grid slot kept per camera
 
     joy_t: List[np.ndarray] = []
     joy_x: List[np.ndarray] = []
@@ -316,13 +318,21 @@ def load_window(
                 node = record.node
                 if t0_ns is not None and start_ns <= t <= stop_ns:
                     if camera_names is None or node in camera_names:
-                        prev = cam_times[node]
-                        if min_gap_ns and prev and (t - prev[-1]) < min_gap_ns:
-                            continue  # decimate: too close to the last kept frame
+                        # Decimate onto a fixed 1/max_fps grid: keep the first
+                        # frame that lands in each slot. Testing the gap against
+                        # the *last kept* frame instead puts a 60 fps camera on a
+                        # knife edge at max_fps=30 (two 16.67 ms intervals equal
+                        # the 33.33 ms threshold exactly), so timestamp jitter
+                        # flips it between keeping every 2nd and every 3rd frame
+                        # and playback judders. Slots cannot drift.
+                        slot = (t - start_ns) // min_gap_ns if min_gap_ns else 0
+                        if min_gap_ns and cam_slot.get(node) == slot:
+                            continue
                         frame = frame_from_image(record.image, target_h)
                         if frame is not None:
                             cam_frames[node].append(frame)
                             cam_times[node].append(t)
+                            cam_slot[node] = slot
                 continue
 
             in_window = t0_ns is not None and start_ns <= t <= stop_ns

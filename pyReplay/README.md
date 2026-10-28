@@ -128,7 +128,18 @@ metadata. The fix:
   because each frame is placed by its timestamp and looked up by nearest-time.
 
 Memory note: frames are held in RAM for smooth playback, so window size × number
-of cameras × resolution is bounded by `target_h` (default 360 px).
+of cameras × resolution is bounded by `target_h` (default 360 px) and `max_fps`.
+
+**`max_fps` decimation is grid-based, and that matters.** Playback and export
+both display at 30 fps, so frames beyond that per camera are decoded, resized
+and held in RAM without ever being shown — `max_fps=30` cuts a 150 fps eye
+camera five-fold. The decimator divides the window into 1/`max_fps` slots and
+keeps the first frame landing in each. The obvious alternative — drop a frame if
+it is closer than 1/`max_fps` to the *last kept* frame — puts a 60 fps camera on
+a knife edge at `max_fps=30`, because two 16.67 ms intervals equal the 33.33 ms
+threshold exactly: timestamp jitter then flips it between keeping every 2nd and
+every 3rd frame, and playback judders even though the speed is correct. Slots
+cannot drift, so they do not have that failure mode.
 
 ---
 
@@ -209,11 +220,60 @@ All files are kept **under 500 lines** (project rule: split before the limit).
 | `loader.py`   | One `decode_video=True` pass → `ReplayWindow`. Parses cameras, joystick, analog, `BehavState` events, and target intervals; reconstructs the cursor. Breaks at `stop`. |
 | `cameras.py`  | `frame_from_image` — reshape + downsize one decoded Gray frame. |
 | `cursor.py`   | joystick → cursor (`[0,1]`) reconstruction (direct + cumulative). |
-| `panels.py`   | `SignalPanels`: matplotlib joystick-2D (cursor + target + center gate) and scrolling analog traces (±`scroll_s`, fixed central playhead). Can build into an external figure (used by export). |
+| `cursor_panel.py` | `CursorPanel` — the cursor/target recreation drawn into one axes (cursor, trail, active target, center gate). `scale` grows markers/fonts with the panel. |
+| `trace_panel.py`  | `TracePanel` — scrolling analog traces (±`scroll_s`, fixed central playhead), stacked or in a row, into gridspec cells or explicit figure rects. |
+| `panels.py`   | `SignalPanels`: the two panels side by side — what the live player embeds. |
+| `packing.py`  | Aspect-aware box packing (`fit` / `pack_row` / `pack_col`) in figure coordinates. |
+| `layouts.py`  | Named MP4 layouts (`stage` / `bigtop` / `cross` / `focus`) + `build_layout` → `ReplayComposite`. See §6a. |
 | `blit.py`     | `BlitManager` — fast partial redraws for smooth live playback. |
-| `player.py`   | `ReplayPlayer` — PyQt6 window: cameras across the top (QPixmap), panels below (embedded blitted matplotlib), play/pause/seek/speed/scroll + **Export MP4**. |
-| `export.py`   | `export_mp4` — one figure (camera row via `imshow` + `SignalPanels`) driven by `FFMpegWriter`, real-time by default. |
+| `player.py`   | `ReplayPlayer` — PyQt6 window: cameras across the top (QPixmap), panels below (embedded blitted matplotlib), play/pause/seek/speed/scroll + layout picker + **Export MP4**. |
+| `export.py`   | `export_mp4` / `export_still` — a layout figure driven by `FFMpegWriter`, real-time by default, 1920×1080 H.264/yuv420p. |
+| `snapshot.py` | Renders the same one second in every layout (clip + still + contact sheet) from a single decode — how you pick a layout. |
 | `run_replay.py` / `__main__.py` | CLI entry. |
+
+### 6a. Video layouts
+
+The MP4 arrangement is chosen by name; all of them follow the same three rules,
+which come from how these videos actually get used in lab meeting:
+
+1. **The cursor/target recreation is the center and the largest single panel** —
+   it is the thing being explained; everything else is context for it.
+2. **Camera images are as large as the frame allows.** Placement is by explicit
+   figure-coordinate *boxes* run through `packing.py`, not by a gridspec: every
+   camera has a fixed aspect ratio, so a uniform grid cell leaves white gutters
+   around the image, and those gutters are most of what makes a composite video
+   feel small. Each camera axes is created already at its frame's aspect and the
+   image fills it edge to edge (`aspect="auto"` on an already-correct box).
+   The camera name is drawn *inside* the image, so no row of the figure is spent
+   on titles.
+3. **The time series is a thin supporting strip** (`compact=True`: label inside
+   the axes, no y ticks), never a main panel.
+
+| layout | arrangement |
+|--------|-------------|
+| `stage`  | cameras in two flanking columns, big cursor panel between them, trace strip across the bottom. |
+| `bigtop` | all cameras in one full-width row at the top; cursor panel centered below, clock left, trace stack right. |
+| `cross`  | the widest camera as a band above the cursor panel, the rest flanking it, traces in the lower-right (**default**). |
+| `focus`  | largest cursor panel; narrow trace stack left, cameras stacked right, widest camera as a band along the bottom. |
+
+`_widest()` picks the band camera by frame aspect, so on AlexRig `Cam Eye`
+(~2.4:1 against the others' 1.25:1) lands in the band slot automatically rather
+than being named in the layout.
+
+**Camera orientation.** `Cam Eye` is mounted upside down, so it is displayed
+rotated 180°. That lives in `adjust.py` (`ROTATED_180` / `orient()`), separate
+from `CameraAdjust` on purpose: `CameraAdjust.is_identity` gates the pipeline's
+bit-exact lossless remux in `py_proc/video_remux.py`, and a rotation must not
+silently force a re-encode there. The rotation therefore applies to the **live
+player and the MP4 export only** — the extracted per-camera `image.mp4` files
+stay in sensor orientation. Add a camera to `ROTATED_180` to rotate it too.
+
+**Adding a layout:** write `_layout_<name>(c, win, cams, opts)` (where `c` is
+the `Canvas` helper) and register it in `LAYOUTS`. Boxes are
+`(left, bottom, width, height)` in figure coordinates. `c.last_boxes` holds the
+boxes the previous `camera_row`/`camera_col` actually used, so a layout can put
+the cursor panel against the real edge of a packed camera group instead of
+guessing at a height that depends on the frame aspects.
 
 ### Data flow
 `load_window()` → `ReplayWindow` (cameras as decoded frame lists + timestamps,
@@ -240,6 +300,18 @@ Options: `--cameras "Cam Top" "Cam Left"` (default auto-detect all), `--scroll`
 360). The window has **Export MP4** (real-time composite) and live
 play/pause/seek/speed/scroll controls.
 
+**Picking a layout.** `pyReplay.snapshot` renders the same one second in every
+layout from a single decode — one MP4 and one PNG each, plus a contact sheet:
+
+```bash
+$PY -m pyReplay.snapshot --day-dir /cdz/pesaranlab/Eevee_Behavior_AlexRig/260924 \
+    --rec 1 --at 121 --out-dir ~/layout_previews
+```
+
+Options: `--seconds` (clip length, default 1), `--layouts stage cross` (subset),
+`--dpi` (120 = 1920×1080, 160 = 2560×1440), `--target-h`, `--max-fps`. Pick an
+instant mid-trial so a target is on screen.
+
 Programmatic use:
 
 ```python
@@ -247,8 +319,14 @@ from pyReplay.loader import load_window
 from pyReplay.export import export_mp4
 win = load_window(behave_path, 30, 60)     # preload (decodes 0→stop once)
 print(win.summary())
-export_mp4(win, "out.mp4", scroll_s=2.0, fps=30)
+export_mp4(win, "out.mp4", layout="cross", scroll_s=2.0, fps=30)
 ```
+
+**Output format.** The default is 16:9 at 1920×1080 (`figsize=(16, 9)`,
+`dpi=120`), H.264 / `yuv420p` / crf 18 with `+faststart` — the combination Slack,
+Keynote/PowerPoint and QuickTime all play without re-encoding, which is what
+makes these shareable in lab. `dpi=160` gives 2560×1440 from the same figure.
+`start_s` / `duration_s` render a sub-span of an already-loaded window.
 
 ---
 

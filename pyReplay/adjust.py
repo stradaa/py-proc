@@ -91,3 +91,24 @@ DEFAULTS: dict[str, CameraAdjust] = {
 def resolve(name: str) -> CameraAdjust:
     """Correction for camera `name`; identity (pass-through) if unknown."""
     return DEFAULTS.get(name, CameraAdjust())
+
+
+# --- geometric orientation -------------------------------------------------
+# Cameras physically mounted upside down. This is display geometry, not an
+# intensity remap, so it is kept out of CameraAdjust (whose `is_identity` gates
+# the pipeline's lossless remux in py_proc/video_remux.py — a rotation must not
+# silently force a re-encode there). Applied by the replay player and the MP4
+# export only; the extracted per-camera videos are left in sensor orientation.
+ROTATED_180: set[str] = {"Cam Eye"}
+
+
+def is_rotated_180(name: str) -> bool:
+    """True if camera `name` should be displayed rotated by 180 degrees."""
+    return name in ROTATED_180
+
+
+def orient(name: str, frame: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """Return `frame` in display orientation for camera `name`."""
+    if frame is None or not is_rotated_180(name):
+        return frame
+    return np.ascontiguousarray(frame[::-1, ::-1])

@@ -30,6 +30,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
 from pyReplay import adjust
 from pyReplay.blit import BlitManager
+from pyReplay.layouts import DEFAULT_LAYOUT, LAYOUTS
 from pyReplay.panels import SignalPanels
 from pyReplay.window import CameraTrack, ReplayWindow
 
@@ -183,6 +184,13 @@ class ReplayPlayer(QWidget):
         self.scroll_box.valueChanged.connect(self._on_scroll)
         bar.addWidget(self.scroll_box)
 
+        bar.addWidget(QLabel("Layout"))
+        self.layout_box = QComboBox()
+        for name in LAYOUTS:
+            self.layout_box.addItem(name)
+        self.layout_box.setCurrentText(DEFAULT_LAYOUT)
+        bar.addWidget(self.layout_box)
+
         self.export_btn = QPushButton("Export MP4")
         self.export_btn.clicked.connect(self._on_export)
         bar.addWidget(self.export_btn)
@@ -244,7 +252,8 @@ class ReplayPlayer(QWidget):
 
         self.export_btn.setEnabled(False)
         try:
-            export_mp4(self.win, path, scroll_s=self.panels.scroll_s, progress=prog)
+            export_mp4(self.win, path, layout=self.layout_box.currentText(),
+                       scroll_s=self.panels.scroll_s, progress=prog)
         except RuntimeError:
             pass  # user cancelled
         finally:
@@ -256,7 +265,8 @@ class ReplayPlayer(QWidget):
         t_ns = self.win.rel_to_ns(t_rel_s)
         for name, view in self.cam_views.items():
             track: CameraTrack = self.win.cameras[name]
-            view.set_frame(self.cam_adjust[name].apply(track.frame_at(t_ns)))
+            frame = self.cam_adjust[name].apply(track.frame_at(t_ns))
+            view.set_frame(adjust.orient(name, frame))
 
         self.panels.update(t_rel_s)
         self.blit.update()

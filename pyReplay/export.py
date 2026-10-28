@@ -1,74 +1,90 @@
-"""Render a ReplayWindow to a composite MP4 (cameras + joystick + traces).
+"""Render a ReplayWindow to a composite MP4 (cameras + cursor panel + traces).
 
-Builds one matplotlib figure — a camera row across the top (imshow) above the
-same SignalPanels used by the live player — and drives it frame by frame with
-matplotlib's FFMpegWriter, exactly like pyCheck/joystick_validation.py's
-render_trial_replay_video. Output runs at real time by default (playback_speed
-1.0); frames step through the window by 1/fps * playback_speed seconds.
+The arrangement comes from pyReplay/layouts.py — pick one with `layout=`. The
+figure is driven frame by frame with matplotlib's FFMpegWriter; output runs at
+real time by default (playback_speed 1.0), stepping 1/fps * playback_speed
+seconds through the window per frame.
+
+Defaults target a share-ready file: 16:9 at 1920x1080 (figsize 16x9 at dpi 120)
+encoded H.264 / yuv420p, which is what Slack, Keynote/PowerPoint and QuickTime
+all play without re-encoding. Bump `dpi` to 160 for 2560x1440.
 """
 
 from __future__ import annotations
 
 import pathlib
-from typing import Callable, List, Optional
+from typing import Callable, Optional, Sequence, Tuple
 
-import numpy as np
 from matplotlib.animation import FFMpegWriter
-from matplotlib.figure import Figure
 
-from pyReplay import adjust
-from pyReplay.panels import SignalPanels
+from pyReplay.layouts import DEFAULT_LAYOUT, build_layout
 from pyReplay.window import ReplayWindow
+
+# H.264 with yuv420p: the combination every player/chat client accepts. crf 18
+# is visually lossless for this kind of synthetic frame at a sane file size.
+FFMPEG_ARGS = ["-vcodec", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+               "-preset", "medium", "-movflags", "+faststart"]
+
+DEFAULT_FIGSIZE = (16.0, 9.0)
+DEFAULT_DPI = 120                 # 16x9 in at 120 dpi = 1920x1080
 
 
 def export_mp4(
     win: ReplayWindow,
     out_path: str,
     *,
+    layout: str = DEFAULT_LAYOUT,
     scroll_s: float = 2.0,
     fps: int = 30,
     playback_speed: float = 1.0,
-    dpi: int = 100,
+    figsize: Tuple[float, float] = DEFAULT_FIGSIZE,
+    dpi: int = DEFAULT_DPI,
+    camera_names: Optional[Sequence[str]] = None,
+    start_s: Optional[float] = None,
+    duration_s: Optional[float] = None,
     progress: Optional[Callable[[float], None]] = None,
 ) -> str:
-    cams = list(win.cameras)
-    ncam = max(len(cams), 1)
+    """Render `win` to `out_path` and return the path.
 
-    fig = Figure(figsize=(4.2 * ncam, 4.2 * ncam / 2 + 4.4), facecolor="white")
-    outer = fig.add_gridspec(2, 1, height_ratios=[3, 2], hspace=0.12,
-                             left=0.05, right=0.97, top=0.95, bottom=0.08)
+    start_s / duration_s restrict the render to a sub-span of the window
+    (seconds relative to the recording start); both default to the whole window.
+    """
+    comp = build_layout(layout, win, figsize=figsize, scroll_s=scroll_s,
+                        camera_names=camera_names)
 
-    # Per-camera brightness/contrast/gamma correction (identity for unknowns).
-    cam_adjust = {name: adjust.resolve(name) for name in cams}
+    t_start = win.start_s if start_s is None else max(start_s, win.start_s)
+    span = win.duration_s if duration_s is None else duration_s
+    span = min(span, win.stop_s - t_start)
+    n_frames = max(int(span * fps / max(playback_speed, 1e-9)), 1)
 
-    # Camera row (imshow), one axis per camera.
-    cam_gs = outer[0].subgridspec(1, ncam, wspace=0.04)
-    cam_im = {}
-    for col, name in enumerate(cams):
-        ax = fig.add_subplot(cam_gs[0, col])
-        ax.set_title(name, fontsize=10)
-        ax.set_xticks([]); ax.set_yticks([])
-        first = win.cameras[name].frames[0] if win.cameras[name].frames else np.zeros((2, 2), np.uint8)
-        cam_im[name] = ax.imshow(cam_adjust[name].apply(first), cmap="gray",
-                                 vmin=0, vmax=255, aspect="equal", animated=True)
-
-    # Joystick + trace panels reuse the live player's SignalPanels.
-    panels = SignalPanels(win, scroll_s=scroll_s, fig=fig, host=outer[1])
-
-    n_frames = max(int(win.duration_s * fps / max(playback_speed, 1e-9)), 1)
     out_path = str(pathlib.Path(out_path))
-    writer = FFMpegWriter(fps=fps, metadata={"comment": f"pyReplay {win.source}"})
+    writer = FFMpegWriter(fps=fps, extra_args=FFMPEG_ARGS,
+                          metadata={"comment": f"pyReplay {win.source} [{layout}]"})
 
-    with writer.saving(fig, out_path, dpi=dpi):
+    with writer.saving(comp.fig, out_path, dpi=dpi):
         for i in range(n_frames):
-            t_rel = win.start_s + (i / fps) * playback_speed
-            t_ns = win.rel_to_ns(t_rel)
-            for name, im in cam_im.items():
-                frame = win.cameras[name].frame_at(t_ns)
-                if frame is not None:
-                    im.set_data(cam_adjust[name].apply(frame))
-            panels.update(t_rel)
+            comp.update(t_start + (i / fps) * playback_speed)
             writer.grab_frame()
             if progress is not None and (i % 5 == 0 or i == n_frames - 1):
                 progress((i + 1) / n_frames)
+    return out_path
+
+
+def export_still(
+    win: ReplayWindow,
+    out_path: str,
+    t_rel_s: float,
+    *,
+    layout: str = DEFAULT_LAYOUT,
+    scroll_s: float = 2.0,
+    figsize: Tuple[float, float] = DEFAULT_FIGSIZE,
+    dpi: int = DEFAULT_DPI,
+    camera_names: Optional[Sequence[str]] = None,
+) -> str:
+    """Render a single frame at `t_rel_s` to a PNG — a layout preview."""
+    comp = build_layout(layout, win, figsize=figsize, scroll_s=scroll_s,
+                        camera_names=camera_names)
+    comp.update(t_rel_s)
+    out_path = str(pathlib.Path(out_path))
+    comp.fig.savefig(out_path, dpi=dpi, facecolor=comp.fig.get_facecolor())
     return out_path

@@ -9,8 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from PyQt6.QtCore import QDate, QObject, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, pyqtSignal
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import QDate, QObject, QRunnable, QSettings, Qt, QThreadPool, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -54,6 +54,9 @@ from pyCheck.joystick_validation import (
     plot_trial_trajectory,
 )
 from py_proc.run_day_pipeline import run_day_pipeline
+from proc_gui.collapsible import CollapsiblePanel
+from proc_gui.image_view import ImagePreview
+from proc_gui.layout_state import LayoutState
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp"}
@@ -83,46 +86,6 @@ class Worker(QRunnable):
         self.signals.finished.emit(result, buffer.getvalue())
 
 
-class ImagePreview(QScrollArea):
-    def __init__(self) -> None:
-        super().__init__()
-        self.setWidgetResizable(True)
-        self.label = QLabel("No image selected")
-        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.label.setMinimumSize(QSize(400, 300))
-        self.setWidget(self.label)
-        self._pixmap: Optional[QPixmap] = None
-
-    def set_image(self, image_path: Path) -> None:
-        pixmap = QPixmap(str(image_path))
-        if pixmap.isNull():
-            self.label.setText(f"Could not load image:\n{image_path}")
-            self._pixmap = None
-            return
-        self._pixmap = pixmap
-        self._refresh_scaled_pixmap()
-
-    def clear_image(self, text: str = "No image selected") -> None:
-        self._pixmap = None
-        self.label.setPixmap(QPixmap())
-        self.label.setText(text)
-
-    def resizeEvent(self, event: Any) -> None:
-        super().resizeEvent(event)
-        self._refresh_scaled_pixmap()
-
-    def _refresh_scaled_pixmap(self) -> None:
-        if self._pixmap is None:
-            return
-        viewport_size = self.viewport().size()
-        scaled = self._pixmap.scaled(
-            viewport_size,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.label.setPixmap(scaled)
-
-
 class ProcGuiWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -146,13 +109,18 @@ class ProcGuiWindow(QMainWindow):
         self._replay_probe_seq = 0
         self._replay_ram_warn_gb = 6.0   # confirm before loads larger than this
         self._monkey_dir: Optional[Path] = None
+        self._focus_restore: dict[str, bool] = {}
         _s = QSettings("PesaranLab", "ProcGui")
         _saved = _s.value("ProcGui/monkey_dir", "")
         if _saved:
             _candidate = Path(_saved).resolve()
             if _candidate.is_dir():
                 self._monkey_dir = _candidate
+        self.layout_state = LayoutState()
         self._build_ui()
+        # Panel sizes, minimised panels and the active tab come back as the
+        # previous session left them.
+        self.layout_restored = self.layout_state.restore(self)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -750,13 +718,23 @@ class ProcGuiWindow(QMainWindow):
 
         # Center column stacks Inputs, the action tabs, and the Output Log so
         # the log is always on screen and the tab area can scroll internally.
-        center_splitter.addWidget(inputs_container)
-        center_splitter.addWidget(actions_container)
-        center_splitter.addWidget(log_group)
+        # Each row carries its own collapse marker via CollapsiblePanel.
+        io_group.setTitle("")
+        center_splitter.addWidget(
+            self._panel(inputs_container, key="inputs", title="Inputs",
+                        orientation=Qt.Orientation.Vertical)
+        )
+        center_splitter.addWidget(
+            self._panel(actions_container, key="actions", title="Actions",
+                        orientation=Qt.Orientation.Vertical)
+        )
+        center_splitter.addWidget(
+            self._panel(log_group, key="log", orientation=Qt.Orientation.Vertical)
+        )
         center_splitter.setStretchFactor(0, 0)
         center_splitter.setStretchFactor(1, 5)
         center_splitter.setStretchFactor(2, 2)
-        center_splitter.setSizes([110, 520, 200])
+        center_splitter.setSizes([130, 520, 200])
 
         # Repo table and Day Notes each get their own full-height column.
         for column in (repo_group, notes_group, center_splitter):
@@ -790,7 +768,9 @@ class ProcGuiWindow(QMainWindow):
         self.image_list = QListWidget()
         self.image_list.itemSelectionChanged.connect(self._show_selected_image)
         images_layout.addWidget(self.image_list)
-        right_splitter.addWidget(images_container)
+        right_splitter.addWidget(
+            self._panel(images_container, key="figures", title="Figures")
+        )
 
         self.preview = ImagePreview()
         right_splitter.addWidget(self.preview)
@@ -798,9 +778,11 @@ class ProcGuiWindow(QMainWindow):
         right_splitter.setStretchFactor(1, 1)
         right_splitter.setSizes([220, 700])
 
-        main_splitter.addWidget(repo_group)
-        main_splitter.addWidget(notes_group)
-        main_splitter.addWidget(center_splitter)
+        main_splitter.addWidget(self._panel(repo_group, key="repo"))
+        main_splitter.addWidget(self._panel(notes_group, key="notes"))
+        main_splitter.addWidget(
+            self._panel(center_splitter, key="controls", title="Controls")
+        )
         main_splitter.addWidget(right_splitter)
         main_splitter.setStretchFactor(0, 2)
         main_splitter.setStretchFactor(1, 2)
@@ -808,8 +790,87 @@ class ProcGuiWindow(QMainWindow):
         main_splitter.setStretchFactor(3, 4)
         main_splitter.setSizes([260, 300, 420, 620])
 
+        self.layout_state.add_splitter("main", main_splitter)
+        self.layout_state.add_splitter("center", center_splitter)
+        self.layout_state.add_splitter("right", right_splitter)
+        self.layout_state.add_value(
+            "tab_index", tabs.currentIndex, lambda v: tabs.setCurrentIndex(int(v))
+        )
+        self._build_view_menu()
+
         if self._monkey_dir is not None:
             self._refresh_day_table()
+
+    def _panel(
+        self,
+        content: QWidget,
+        *,
+        key: str,
+        title: str = "",
+        orientation: Qt.Orientation = Qt.Orientation.Horizontal,
+    ) -> CollapsiblePanel:
+        """Wrap a splitter child so it can be minimised, and register it for
+        layout persistence and the View menu."""
+        panel = CollapsiblePanel(content, key=key, title=title, orientation=orientation)
+        self.layout_state.add_panel(panel)
+        return panel
+
+    def _build_view_menu(self) -> None:
+        """View menu: one checkable entry per panel plus a layout reset, so a
+        minimised panel can always be brought back from the keyboard."""
+        menu = self.menuBar().addMenu("&View")
+        self._panel_actions = {}
+        for index, panel in enumerate(self.layout_state.panels(), start=1):
+            action = QAction(f"Show {panel.title}", self)
+            action.setCheckable(True)
+            action.setChecked(not panel.is_collapsed())
+            if index <= 9:
+                action.setShortcut(QKeySequence(f"Ctrl+Shift+{index}"))
+            action.toggled.connect(
+                lambda shown, p=panel: p.set_collapsed(not shown)
+            )
+            panel.collapsedChanged.connect(
+                lambda collapsed, a=action: a.setChecked(not collapsed)
+            )
+            menu.addAction(action)
+            self._panel_actions[panel.key] = action
+        menu.addSeparator()
+        self.focus_figure_action = QAction("Maximise Figure Preview", self)
+        self.focus_figure_action.setCheckable(True)
+        self.focus_figure_action.setShortcut(QKeySequence("Ctrl+Shift+F"))
+        focus_tip = (
+            "Minimise every panel so the figure preview gets the whole window. "
+            "Toggling it off puts the panels back the way they were."
+        )
+        self.focus_figure_action.setToolTip(focus_tip)
+        self.focus_figure_action.setStatusTip(focus_tip)
+        self.focus_figure_action.toggled.connect(self._toggle_figure_focus)
+        menu.addAction(self.focus_figure_action)
+        show_all = QAction("Show All Panels", self)
+        show_all.setShortcut(QKeySequence("Ctrl+Shift+0"))
+        show_all.triggered.connect(self._show_all_panels)
+        menu.addAction(show_all)
+        reset = QAction("Reset Layout", self)
+        reset.setToolTip("Forget the saved layout and restore the default arrangement")
+        reset.triggered.connect(lambda: self.layout_state.reset(self))
+        menu.addAction(reset)
+
+    def _show_all_panels(self) -> None:
+        for panel in self.layout_state.panels():
+            panel.expand()
+
+    def _toggle_figure_focus(self, focused: bool) -> None:
+        """Collapse everything but the figure preview, remembering which
+        panels were already minimised so the toggle is reversible."""
+        panels = self.layout_state.panels()
+        if focused:
+            self._focus_restore = {p.key: p.is_collapsed() for p in panels}
+            for panel in panels:
+                panel.collapse()
+            return
+        for panel in panels:
+            panel.set_collapsed(self._focus_restore.get(panel.key, False))
+        self._focus_restore = {}
 
     def _wrap_layout(self, layout: QHBoxLayout) -> QWidget:
         widget = QWidget()
@@ -2009,6 +2070,7 @@ class ProcGuiWindow(QMainWindow):
             s.setValue("ProcGui/monkey_dir", str(self._monkey_dir))
         else:
             s.remove("ProcGui/monkey_dir")
+        self.layout_state.save(self)
         super().closeEvent(event)
 
 
@@ -2022,5 +2084,8 @@ def json_like(value: Any) -> str:
 def run() -> None:
     app = QApplication([])
     window = ProcGuiWindow()
-    window.showMaximized()
+    if window.layout_restored:
+        window.show()   # geometry already restored from the last session
+    else:
+        window.showMaximized()
     app.exec()
