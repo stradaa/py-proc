@@ -17,6 +17,7 @@ from scipy.io import loadmat, savemat
 from .helpers import (rec_paths, get_fs_rec,
                       timestamp_alignment_distance, get_used_trial_values_struct)
 from .pre_proc import pre_proc, load_ev_mat
+from pyjoystick.tasks import canonical_task_type, is_touch_input_fail
 
 
 def proc_events(day, rec, monkeydir, use_display=True, out_suffix=''):
@@ -80,10 +81,11 @@ def proc_events(day, rec, monkeydir, use_display=True, out_suffix=''):
         # ---- Parse trial config ----------------------------------------------
         tc = trial_config[itrial] if itrial < len(trial_config) else ''
         tc_struct = _parse_config(tc)
-        trial_type = tc_struct.get('task_type', '')
+        raw_trial_type = tc_struct.get('task_type', '')
+        trial_type = canonical_task_type(raw_trial_type)
 
         if trial_type == 'null':
-            Events['PyTaskType'].append(trial_type)
+            Events['PyTaskType'].append(raw_trial_type)
             Events['UsedValues'].append({})
             Events['TargetConfigs'].append([])
             Events['TargetValues'].append([])
@@ -93,7 +95,7 @@ def proc_events(day, rec, monkeydir, use_display=True, out_suffix=''):
             test_targets = tc_struct.get('targets', [])
             uv_entry = used_values[itrial] if itrial < len(used_values) else ''
             used_values_struct, target_values = get_used_trial_values_struct(uv_entry)
-            Events['PyTaskType'].append(trial_type)
+            Events['PyTaskType'].append(raw_trial_type)
             Events['UsedValues'].append(used_values_struct)
             Events['TargetConfigs'].append(_rename_target_configs(test_targets))
             Events['TargetValues'].append(target_values)
@@ -397,7 +399,7 @@ def _get_first_task_type(trial_config):
     if not trial_config:
         return ''
     tc = _parse_config(trial_config[0])
-    return tc.get('task_type', '')
+    return canonical_task_type(tc.get('task_type', ''))
 
 
 def _is_simple_task(trial_type):
@@ -495,6 +497,8 @@ def _init_events(ntrials):
         'Pulse_end': _nan(n),
         # Joystick task timing
         'JoystickAttemptCount': _nan(n),
+        # 1 = trial ended by fail_on_touch_input (not a joystick attempt)
+        'JoystickTouchFail': _nan(n),
         'JoystickTargetOn': _nan(n),
         'JoystickFirstMovement': _nan(n),
         'JoystickTargetEntry': _nan(n),
@@ -725,6 +729,7 @@ def _populate_joystick(Events, itrial, br, w_drift_ros):
 
     Events['JoystickAttemptCount'][itrial] = float(
         br.get('trial_attempt_count', len(br.get('attempts', []))))
+    Events['JoystickTouchFail'][itrial] = 1.0 if is_touch_input_fail(br) else 0.0
 
     attempt_events = final_attempt.get('events', [])
     if not isinstance(attempt_events, list) or not attempt_events:

@@ -14,6 +14,7 @@ from scipy.signal import medfilt
 
 from .helpers import (rec_paths, get_fs_rec, event_match)
 from .pre_proc import load_ev_mat
+from pyjoystick.tasks import canonical_task_type
 
 
 # Display states that trigger a screen update (match across all task types)
@@ -185,7 +186,7 @@ def proc_display(day, rec, monkeydir, out_suffix=''):
         else:
             tc_struct = tc if isinstance(tc, dict) else {}
 
-        trial_type = tc_struct.get('task_type', '')
+        trial_type = canonical_task_type(tc_struct.get('task_type', ''))
         display_states = _DISPLAY_STATES_BY_TASK.get(trial_type, set())
         max_latency = _MAX_LATENCY_BY_TASK.get(trial_type, default_max_latency)
 

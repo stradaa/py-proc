@@ -11,6 +11,7 @@ from scipy.io import loadmat, savemat
 from scipy.signal import savgol_filter, find_peaks
 
 from .helpers import rec_paths, loadlpeye
+from pyjoystick.tasks import canonical_task_type
 
 
 def proc_saccade(day, rec, monkeydir, out_suffix=''):
@@ -237,7 +238,7 @@ def _peak_half_width(vel, sacc_loc):
 def _get_task_type(Events, itrial):
     tt = Events.get('PyTaskType', [])
     if hasattr(tt, '__len__') and len(tt) > itrial:
-        return str(tt[itrial])
+        return canonical_task_type(tt[itrial])
     return ''
 
 

@@ -39,6 +39,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
+from pyjoystick.tasks import is_touch_input_fail
+
 try:
     from .cross_day_plots import _parse_day_rec_selection, _default_out_dir, _is_requested_task, _summarize_modes
     from .cross_day_kinematics_plots import plot_cross_day_kinematics
@@ -58,7 +60,7 @@ except ImportError:  # pragma: no cover - script-mode fallback
 # Scalar metric columns (the direction heatmap lives only in the JSON).
 _KIN_FIELDS = [
     "day", "selected_recs", "control_mode", "position_velocity_blend", "control_mode_mixed",
-    "n_included_trials",
+    "n_included_trials", "n_touch_fail_trials",
     "median_reaction_time_ms", "median_transport_time_ms",
     "median_acquisition_time_ms", "reaction_time_cv",
     "median_initial_direction_error_deg", "median_submovement_count",
@@ -102,6 +104,7 @@ def build_day_kinematics(
     rec_trial_counts: List[int] = []
     rec_spans_s: List[float] = []
     included = 0
+    touch_fails = 0
     control_modes: set[str] = set()
     blend_values: set[float] = set()
 
@@ -124,10 +127,15 @@ def build_day_kinematics(
             alltrial = get_trial_row(dataset.all_trials, trial_index)
             if not _is_requested_task(alltrial.get("PyTaskType", ""), requested_task_types):
                 continue
+            behav_result = dataset.behav_results[trial_index]
+            # Screen-touch fails aren't joystick attempts (and fire rapid-fire
+            # while the screen is held), so keep them out of every metric.
+            if is_touch_input_fail(behav_result):
+                touch_fails += 1
+                continue
             included += 1
             rec_trials += 1
 
-            behav_result = dataset.behav_results[trial_index]
             attempt = _get_final_attempt(behav_result)
             success = int(round(float(alltrial.get("Success", 0)))) == 1
 
@@ -214,6 +222,7 @@ def build_day_kinematics(
         "position_velocity_blend": blend_repr,
         "control_mode_mixed": int(mode_mixed),
         "n_included_trials": int(included),
+        "n_touch_fail_trials": int(touch_fails),
         "median_reaction_time_ms": 1e3 * _median(rt),
         "median_transport_time_ms": 1e3 * _median(transport),
         "median_acquisition_time_ms": 1e3 * _median(acquisition),

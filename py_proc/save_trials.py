@@ -231,6 +231,7 @@ def _extract_trial(Events, itrial, day, rec):
         'ReachSize': float(_scalar(Events.get('ReachSize', [np.nan]), itrial, np.nan)),
         'RewardReceived': float(_scalar(Events.get('RewardReceived', [0]), itrial, 0)),
         'JoystickAttemptCount': float(_scalar(Events.get('JoystickAttemptCount', [np.nan]), itrial, np.nan)),
+        'JoystickTouchFail': float(_scalar(Events.get('JoystickTouchFail', [np.nan]), itrial, np.nan)),
 
         # Electrophysiology stubs
         'MT1': np.nan, 'MT2': np.nan, 'Ch': np.nan, 'Gain': np.nan,

@@ -10,6 +10,7 @@ import numpy as np
 from scipy.io import loadmat, savemat
 
 from .helpers import rec_paths, loadroshnd
+from pyjoystick.tasks import canonical_task_type
 
 
 def proc_reach(day, rec, monkeydir, out_suffix=''):
@@ -228,7 +229,7 @@ def _find_first(arr, op, threshold):
 def _get_task_type(Events, itrial):
     tt = Events.get('PyTaskType', [])
     if hasattr(tt, '__len__') and len(tt) > itrial:
-        return str(tt[itrial])
+        return canonical_task_type(tt[itrial])
     return ''
 
 

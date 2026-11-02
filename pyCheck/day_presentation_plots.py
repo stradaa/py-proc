@@ -17,6 +17,7 @@ from pyCheck.day_behavior_metrics import (
     plot_overshoot_attempts,
 )
 from pyCheck.plot_utils import _flat, _save_figure, _title_suffix
+from pyjoystick.tasks import canonical_task_type, is_touch_input_fail
 
 
 def _load_all_trials(repo_root: Path, day: str) -> Dict[str, np.ndarray]:
@@ -555,6 +556,35 @@ def _filter_trial_rows(data: Dict[str, np.ndarray], keep: np.ndarray) -> Dict[st
     return filtered
 
 
+def _touch_fail_flags(repo_root: Path, day: str, data: Dict[str, np.ndarray]) -> np.ndarray:
+    """Per-row fail_on_touch_input flag. Uses AllTrials.JoystickTouchFail when
+    present; days processed before that column existed fall back to each rec's
+    ev.mat behav_results (AllTrials rows are per-rec, in ev.mat trial order)."""
+    if "JoystickTouchFail" in data:
+        return np.nan_to_num(_flat(data, "JoystickTouchFail", float)) == 1.0
+    rec = _flat(data, "Rec", int)
+    flags = np.zeros(len(rec), dtype=bool)
+    for r in sorted(np.unique(rec).tolist()):
+        rows = np.flatnonzero(rec == r)
+        ev_path = repo_root / day / f"{r:03d}" / f"rec{r:03d}.ev.mat"
+        try:
+            ev = loadmat(ev_path, simplify_cells=True)
+        except Exception as exc:  # noqa: BLE001 - a missing ev.mat just means no exclusion
+            print(f"touch_fail: could not read {ev_path} ({exc}); not excluding rec{r:03d}")
+            continue
+        behav = ev.get("behav_results", [])
+        behav = list(behav) if isinstance(behav, (list, np.ndarray)) else [behav]
+        for k, row in enumerate(rows[:len(behav)]):
+            br = behav[k]
+            if isinstance(br, str):
+                try:
+                    br = json.loads(br)
+                except ValueError:
+                    br = {}
+            flags[row] = is_touch_input_fail(br)
+    return flags
+
+
 def _day_control_mode(repo_root: Path, day: str, recs: List[int]) -> Dict[str, object]:
     """Control-mode provenance for the day: {control_mode, position_velocity_blend,
     mixed} across the recs (from each rec's task_config). Non-fatal on load error."""
@@ -600,15 +630,19 @@ def generate_day_presentation_plots(
         print("Filtering task types: none")
 
     data = _load_all_trials(repo_root_path, day)
+    # Flag screen-touch fails before any row filtering (the ev.mat fallback
+    # needs every rec's rows in order).
+    data["JoystickTouchFail"] = _touch_fail_flags(repo_root_path, day, data).astype(float)
     if exclude_recs:
         rec = _flat(data, "Rec", int)
         keep = ~np.isin(rec, np.asarray(exclude_recs, dtype=int))
         data = _filter_trial_rows(data, keep)
 
     if task_types:
-        requested = {str(task_type).strip().lower() for task_type in task_types if str(task_type).strip()}
+        # Rust delegates match their Python task (joystick_intro_rust == joystick_intro).
+        requested = {canonical_task_type(task_type).lower() for task_type in task_types if str(task_type).strip()}
         task_type_values = _flat(data, "PyTaskType", object)
-        keep = np.array([str(task).strip().lower() in requested for task in task_type_values], dtype=bool)
+        keep = np.array([canonical_task_type(task).lower() in requested for task in task_type_values], dtype=bool)
         print(f"Trials kept after task filter: {int(np.sum(keep))} / {len(keep)}")
         data = _filter_trial_rows(data, keep)
 
@@ -616,7 +650,30 @@ def generate_day_presentation_plots(
     # task target_on on the shared record.time clock) rather than from the
     # legacy recorder-clock AllTrials.disStartOn, which drifts by ~2 s on recent
     # AlexRig days. Fall back to AllTrials if the behave captures are missing.
-    display_data = data
+    # Screen-touch fails (fail_on_touch_input) aren't joystick attempts and can
+    # fire back-to-back while the screen is held, so they'd swamp success rate,
+    # failure modes and engagement. Report them on their own and drop them from
+    # every performance metric. They still had a target onset, so the display
+    # alignment keeps them.
+    all_rows = data
+    touch_fail = _flat(data, "JoystickTouchFail", float) == 1.0
+    rec_all = _flat(data, "Rec", int)
+    touch_fail_summary = {
+        "n_touch_fail_trials": int(np.sum(touch_fail)),
+        "touch_fail_rate": float(np.mean(touch_fail)) if touch_fail.size else float("nan"),
+        "per_rec": {
+            f"rec{r:03d}": {
+                "n_touch_fail_trials": int(np.sum(touch_fail & (rec_all == r))),
+                "n_trials": int(np.sum(rec_all == r)),
+            }
+            for r in sorted(np.unique(rec_all).tolist())
+        },
+    }
+    if np.any(touch_fail):
+        print(f"Excluding {int(np.sum(touch_fail))} screen-touch fail trials from performance metrics")
+        data = _filter_trial_rows(data, ~touch_fail)
+
+    display_data = all_rows
     try:
         from pyCheck.display_behave import day_display_data
 
@@ -634,6 +691,7 @@ def generate_day_presentation_plots(
               f"falling back to AllTrials.disStartOn")
 
     metrics = {
+        "touch_input_fails": touch_fail_summary,
         "session_overview": plot_session_overview(
             data, out_dir_path / f"{day}_overview_by_rec.png", day, exclude_recs
         ),

@@ -48,6 +48,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
+from pyjoystick.tasks import TOUCH_INPUT_FAILURE_REASON
+
 from pyCheck.cross_day_plots import _compute_path_efficiency
 from pyCheck.joystick_validation import (
     JoystickDataset,
@@ -208,6 +210,9 @@ def _collect_rec(dataset: JoystickDataset, day: str, rec: int) -> List[AttemptRe
                 continue
             phase = str(attempt.get("schedule_phase") or "")
             if not phase:
+                continue
+            # Screen-touch fails aren't joystick attempts.
+            if str(attempt.get("failure_reason") or "").lower() == TOUCH_INPUT_FAILURE_REASON:
                 continue
             target_position = attempt.get("target_position") or {}
             raw_idx = attempt.get("target_index")

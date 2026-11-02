@@ -35,6 +35,8 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
+from pyjoystick.tasks import canonical_task_type
+
 from thalamus.record_reader2 import RecordReader
 
 # AlexRig NIDAQ "Analog in" photodiode span (see procThalamus_indie.py / pyReplay).
@@ -110,7 +112,7 @@ def compute_rec_latencies(
       target_on_ns, edge_ns, latency_ms (NaN if unmatched), outcome (object).
     """
     behave_path = str(behave_path)
-    want = ({str(t).strip().lower() for t in task_types}
+    want = ({canonical_task_type(t).lower() for t in task_types}
             if task_types else None)
 
     photo_t: List[np.ndarray] = []
@@ -143,7 +145,7 @@ def compute_rec_latencies(
                 if not isinstance(doc, dict) or "task_config" not in doc:
                     continue
                 if want is not None:
-                    tt = str(doc.get("task_config", {}).get("task_type", "")).strip().lower()
+                    tt = canonical_task_type(doc.get("task_config", {}).get("task_type", "")).lower()
                     if tt not in want:
                         continue
                 t_on = _trial_target_on_ns(doc)

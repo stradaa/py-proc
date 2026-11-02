@@ -10,6 +10,7 @@ import numpy as np
 from scipy.io import loadmat
 
 from py_proc.helpers import parse_rec_spec
+from pyjoystick.tasks import canonical_task_type, is_touch_input_fail
 
 try:
     from .joystick_validation import _get_final_attempt, get_trial_row, load_joystick_dataset, select_attempt_event
@@ -75,7 +76,9 @@ def _default_out_dir(repo_root: Path) -> Path:
 def _is_requested_task(task_value: object, requested: set[str]) -> bool:
     if not requested:
         return True
-    return str(task_value).strip().lower() in requested
+    # Rust delegates match their Python task (joystick_intro_rust == joystick_intro).
+    wanted = {canonical_task_type(t).lower() for t in requested}
+    return canonical_task_type(task_value).lower() in wanted
 
 
 def _first_event_after(events: Sequence[Dict[str, Any]], event_name: str, time_s: float) -> Optional[Dict[str, Any]]:
@@ -147,6 +150,7 @@ def _build_day_summary(
     hold = HoldAccumulator()
     successful_trials = 0
     included_trials = 0
+    touch_fail_trials = 0
     control_modes: set[str] = set()
     blend_values: set[float] = set()
 
@@ -160,6 +164,10 @@ def _build_day_summary(
         for trial_index in range(n_trials):
             alltrial = get_trial_row(dataset.all_trials, trial_index)
             if not _is_requested_task(alltrial.get("PyTaskType", ""), requested_task_types):
+                continue
+            # Screen-touch fails aren't joystick attempts; count them apart.
+            if is_touch_input_fail(dataset.behav_results[trial_index]):
+                touch_fail_trials += 1
                 continue
 
             included_trials += 1
@@ -230,6 +238,9 @@ def _build_day_summary(
         "control_mode_mixed": int(mode_mixed),
         "n_included_trials": int(included_trials),
         "n_successful_trials": int(successful_trials),
+        "n_touch_fail_trials": int(touch_fail_trials),
+        "touch_fail_rate": (float(touch_fail_trials) / float(touch_fail_trials + included_trials)
+                            if (touch_fail_trials + included_trials) else float("nan")),
         "n_trials_with_entry": int(len(first_entry_success_flags)),
         "n_successful_durations": int(len(successful_durations_s)),
         "n_path_efficiency_trials": int(len(path_efficiencies)),
@@ -270,6 +281,8 @@ def _write_summary_csv(rows: Sequence[Dict[str, Any]], out_path: Path) -> None:
         "control_mode_mixed",
         "n_included_trials",
         "n_successful_trials",
+        "n_touch_fail_trials",
+        "touch_fail_rate",
         "n_trials_with_entry",
         "n_successful_durations",
         "n_path_efficiency_trials",
@@ -303,6 +316,7 @@ def _load_summary_csv(out_path: Path) -> List[Dict[str, Any]]:
         "control_mode_mixed",
         "n_included_trials",
         "n_successful_trials",
+        "n_touch_fail_trials",
         "n_trials_with_entry",
         "n_successful_durations",
         "n_path_efficiency_trials",
