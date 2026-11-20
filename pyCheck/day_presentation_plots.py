@@ -17,6 +17,7 @@ from pyCheck.day_behavior_metrics import (
     plot_overshoot_attempts,
 )
 from pyCheck.plot_utils import _flat, _save_figure, _title_suffix
+from pyCheck.task_summaries import PanelCtx, panels_for, plot_day_overview
 from pyjoystick.tasks import canonical_task_type, is_touch_input_fail
 
 
@@ -606,6 +607,38 @@ def _day_control_mode(repo_root: Path, day: str, recs: List[int]) -> Dict[str, o
     }
 
 
+def _joystick_day_extras(
+    repo_root: Path,
+    day: str,
+    data: Dict[str, np.ndarray],
+    out_dir: Path,
+    exclude_recs: List[int],
+) -> Dict[str, object]:
+    """Joystick-only extras that read the recs directly rather than AllTrials:
+    structured center-out outputs and cursor control-mode provenance.  Both are
+    guarded so neither can break the summary."""
+    extras: Dict[str, object] = {}
+
+    # Skipped for days recorded before the schedule feature existed.
+    try:
+        from pyCheck.co_structured import generate_co_structured_outputs
+
+        extras["co_structured"] = generate_co_structured_outputs(
+            repo_root, day, out_dir=out_dir, exclude_recs=exclude_recs
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"co_structured: failed ({exc}); continuing without it")
+        extras["co_structured"] = {"error": str(exc)}
+
+    try:
+        recs = sorted({int(r) for r in np.asarray(_flat(data, "Rec", int)).ravel().tolist()})
+        extras["control_mode"] = _day_control_mode(repo_root, day, recs)
+    except Exception as exc:  # noqa: BLE001
+        print(f"control_mode provenance: skipped ({exc})")
+
+    return extras
+
+
 def generate_day_presentation_plots(
     repo_root: str | Path,
     day: str,
@@ -690,56 +723,58 @@ def generate_day_presentation_plots(
         print(f"display_alignment: behave-direct failed ({exc}); "
               f"falling back to AllTrials.disStartOn")
 
-    metrics = {
+    # Tasks share a day but not their metrics, so every panel set runs over one
+    # task's trials only.  Rust delegates canonicalise onto their Python task.
+    task_values = _flat(data, "PyTaskType", object)
+    tasks = np.array([canonical_task_type(t) for t in task_values], dtype=object)
+
+    metrics: Dict[str, object] = {
+        "day": day,
         "touch_input_fails": touch_fail_summary,
-        "session_overview": plot_session_overview(
-            data, out_dir_path / f"{day}_overview_by_rec.png", day, exclude_recs
+        "day_overview": plot_day_overview(
+            data, tasks, out_dir_path / f"{day}_overview_by_rec.png", day, exclude_recs
         ),
-        "performance_over_time": plot_performance_over_time(
-            data, out_dir_path / f"{day}_performance_over_time.png", exclude_recs
-        ),
+        # Display alignment is a rig property, not a task metric, so it stays
+        # day-level and keeps the touch-fail trials (they still had a target on).
         "display_alignment": plot_display_alignment(
             display_data, out_dir_path / f"{day}_display_alignment.png", exclude_recs
         ),
-        "target_performance": plot_target_performance(
-            data, out_dir_path / f"{day}_target_performance.png", exclude_recs
-        ),
-        "success_failure_timing": plot_success_failure_timing(
-            data, out_dir_path / f"{day}_success_failure_timing.png", exclude_recs
-        ),
-        "kinematic_intervals": plot_kinematic_intervals(
-            data, out_dir_path / f"{day}_kinematic_intervals.png", exclude_recs
-        ),
-        "failure_modes": plot_failure_modes(
-            data, out_dir_path / f"{day}_failure_modes.png", exclude_recs
-        ),
-        "overshoot_attempts": plot_overshoot_attempts(
-            data, out_dir_path / f"{day}_overshoot_attempts.png", exclude_recs
-        ),
-        "engagement": plot_engagement(
-            data, out_dir_path / f"{day}_engagement.png", exclude_recs
-        ),
+        "tasks": {},
     }
 
-    # Structured center-out outputs (schedule_phase-tagged attempts). Skipped
-    # for days recorded before the schedule feature; never breaks the summary.
-    try:
-        from pyCheck.co_structured import generate_co_structured_outputs
+    for task in sorted(set(tasks.tolist())):
+        task_rows = tasks == task
+        task_data = _filter_trial_rows(data, task_rows)
+        task_metrics: Dict[str, object] = {"n_trials": int(np.sum(task_rows))}
+        panels = panels_for(task)
+        if not panels:
+            task_metrics["skipped"] = "no panel set registered for this task"
+            print(f"{task}: {int(np.sum(task_rows))} trials, no panel set registered — skipping")
+            metrics["tasks"][task] = task_metrics
+            continue
 
-        metrics["co_structured"] = generate_co_structured_outputs(
-            repo_root_path, day, out_dir=out_dir_path, exclude_recs=exclude_recs
+        task_dir = out_dir_path / task
+        task_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n--- {task}: {int(np.sum(task_rows))} trials -> {task_dir} ---")
+        ctx = PanelCtx(
+            data=task_data,
+            out_dir=task_dir,
+            day=day,
+            repo_root=repo_root_path,
+            exclude_recs=exclude_recs,
+            task=task,
         )
-    except Exception as exc:  # noqa: BLE001 - never let co_structured break the summary
-        print(f"co_structured: failed ({exc}); continuing without it")
-        metrics["co_structured"] = {"error": str(exc)}
+        for panel in panels:
+            try:
+                task_metrics[panel.key] = panel.run(ctx)
+            except Exception as exc:  # noqa: BLE001 - one bad panel must not lose the rest
+                print(f"{task}/{panel.key}: failed ({exc}); continuing")
+                task_metrics[panel.key] = {"error": str(exc)}
 
-    # Cursor control-mode provenance for the day (from the first loadable rec's
-    # task_config). Guarded so it never breaks the summary.
-    try:
-        recs = sorted({int(r) for r in np.asarray(_flat(data, "Rec", int)).ravel().tolist()})
-        metrics["control_mode"] = _day_control_mode(repo_root_path, day, recs)
-    except Exception as exc:  # noqa: BLE001
-        print(f"control_mode provenance: skipped ({exc})")
+        if task == "joystick_intro":
+            task_metrics.update(_joystick_day_extras(repo_root_path, day, task_data,
+                                                     task_dir, exclude_recs))
+        metrics["tasks"][task] = task_metrics
 
     metrics_path = out_dir_path / f"{day}_summary_metrics.json"
     with open(metrics_path, "w", encoding="utf-8") as fh:

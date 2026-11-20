@@ -4,7 +4,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.io import loadmat
@@ -141,7 +141,10 @@ def _build_day_summary(
     day: str,
     recs: Sequence[int],
     requested_task_types: set[str],
+    loader: Optional[Callable[..., Any]] = None,
 ) -> Dict[str, Any]:
+    # Shared with the other cross-day builders so a rec is opened once per run.
+    load = loader if loader is not None else load_joystick_dataset
     successful_durations_s: List[float] = []
     successful_target_radii: List[float] = []
     hold_break_flags: List[float] = []
@@ -156,7 +159,7 @@ def _build_day_summary(
 
     for rec in recs:
         rec_str = f"{int(rec):03d}"
-        dataset = load_joystick_dataset(repo_root, day, rec_str)
+        dataset = load(repo_root, day, rec_str)
         control_modes.add(str(dataset.control_mode))
         blend_values.add(round(float(dataset.position_velocity_blend), 4))
         n_trials = len(np.asarray(dataset.all_trials["Trial"]).ravel())
@@ -353,6 +356,20 @@ def _merge_summary_rows(existing_rows: Sequence[Dict[str, Any]], new_rows: Seque
     return [merged[day] for day in sorted(merged)]
 
 
+def _safe_build(label: str, day: str, build):
+    """Run one companion's day builder, surviving a day it cannot handle.
+
+    Each companion was previously wrapped in its own try/except around the whole
+    selection, so one bad day killed that figure entirely. Building day by day
+    means a failure can be isolated to the day that caused it.
+    """
+    try:
+        return build()
+    except Exception as exc:  # noqa: BLE001 - one bad day must not lose the figure
+        print(f"{label}: skipped {day} ({exc})")
+        return None
+
+
 def generate_cross_day_plots(
     repo_root: str | Path,
     selections: Sequence[str | Sequence[str]],
@@ -365,10 +382,66 @@ def generate_cross_day_plots(
     requested_task_types = {str(task).strip().lower() for task in (task_types or []) if str(task).strip()}
 
     parsed = [_parse_day_rec_selection(spec, repo_root_path) for spec in selections]
-    rows = [
-        _build_day_summary(repo_root_path, day=day, recs=recs, requested_task_types=requested_task_types)
-        for day, recs in parsed
-    ]
+
+    # Imported here, not at module scope: each companion imports
+    # _parse_day_rec_selection from this module, so a top-level import cycles.
+    try:
+        from .cross_day_cache import DatasetCache, DayRowCache, fingerprint
+        from .cross_day_kinematics import build_day_kinematics
+        from .cross_day_co_structured import build_day_co_structured
+        from .fitts_throughput import build_day_throughput
+    except ImportError:  # pragma: no cover - script-mode fallback
+        from cross_day_cache import DatasetCache, DayRowCache, fingerprint
+        from cross_day_kinematics import build_day_kinematics
+        from cross_day_co_structured import build_day_co_structured
+        from fitts_throughput import build_day_throughput
+
+    # One pass over the data for all four cross-day builders.  Each used to
+    # re-open every rec for itself, which made a selection cost four full passes
+    # (measured: 80 rec loads for 20 recs).  DatasetCache shares a rec across
+    # the builders and is cleared per day so peak memory is one day's recs;
+    # DayRowCache then skips days whose inputs have not changed since last run.
+    row_cache = DayRowCache(out_dir_path)
+    rows: List[Dict[str, Any]] = []
+    kin_rows: List[Dict[str, Any]] = []
+    co_rows: List[Dict[str, Any]] = []
+    tp_rows: List[Dict[str, Any]] = []
+    datasets = DatasetCache()
+
+    for day, recs in parsed:
+        fp = fingerprint(repo_root_path, day, recs, sorted(requested_task_types))
+        cached = row_cache.get(day, fp)
+        if cached is None:
+            datasets.clear()
+            cached = {
+                "summary": _build_day_summary(
+                    repo_root_path, day=day, recs=recs,
+                    requested_task_types=requested_task_types, loader=datasets),
+                "kinematics": _safe_build(
+                    "cross_day_kinematics", day,
+                    lambda: build_day_kinematics(
+                        repo_root_path, day=day, recs=recs,
+                        requested_task_types=requested_task_types, loader=datasets)),
+                "co_structured": _safe_build(
+                    "cross_day_co_structured", day,
+                    lambda: build_day_co_structured(
+                        repo_root_path, day=day, recs=recs, loader=datasets)),
+                "throughput": _safe_build(
+                    "fitts_throughput", day,
+                    lambda: build_day_throughput(
+                        repo_root_path, day=day, recs=recs,
+                        requested_task_types=requested_task_types, loader=datasets)),
+            }
+            row_cache.put(day, fp, cached)
+        rows.append(cached["summary"])
+        for bucket, key in ((kin_rows, "kinematics"), (co_rows, "co_structured"),
+                            (tp_rows, "throughput")):
+            if cached.get(key) is not None:
+                bucket.append(cached[key])
+    datasets.clear()
+    row_cache.save()
+    print(f"cross_day: {datasets.loads} rec loads, {datasets.hits} shared; "
+          f"{row_cache.hits} day(s) from cache, {row_cache.misses} rebuilt")
     rows.sort(key=lambda row: row["day"])
 
     figure_path = out_dir_path / "cross_day_metrics.png"
@@ -428,7 +501,7 @@ def generate_cross_day_plots(
         from .cross_day_kinematics import generate_cross_day_kinematics
 
         kin = generate_cross_day_kinematics(
-            repo_root_path, selections, out_dir_path, task_types
+            repo_root_path, selections, out_dir_path, task_types, rows=kin_rows
         )
         result["kinematics_figure_path"] = kin["figure_path"]
         result["kinematics_metrics_json_path"] = kin["metrics_json_path"]
@@ -443,7 +516,7 @@ def generate_cross_day_plots(
         from .cross_day_co_structured import generate_cross_day_co_structured
 
         co_structured = generate_cross_day_co_structured(
-            repo_root_path, selections, out_dir_path
+            repo_root_path, selections, out_dir_path, rows=co_rows
         )
         result["co_structured_figure_path"] = co_structured["figure_path"]
         result["co_structured_metrics_json_path"] = co_structured["metrics_json_path"]
@@ -457,7 +530,7 @@ def generate_cross_day_plots(
         from .fitts_throughput import generate_cross_day_throughput
 
         throughput = generate_cross_day_throughput(
-            repo_root_path, selections, out_dir_path, task_types
+            repo_root_path, selections, out_dir_path, task_types, rows=tp_rows
         )
         result["throughput_figure_path"] = throughput["figure_path"]
         result["throughput_metrics_json_path"] = throughput["metrics_json_path"]

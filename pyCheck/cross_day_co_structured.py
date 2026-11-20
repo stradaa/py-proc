@@ -31,7 +31,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -148,7 +148,13 @@ def _per_ring_scalars(
 # Day-level aggregation
 # ---------------------------------------------------------------------------
 
-def build_day_co_structured(repo_root: Path, day: str, recs: Sequence[int]) -> Dict[str, Any]:
+def build_day_co_structured(
+    repo_root: Path,
+    day: str,
+    recs: Sequence[int],
+    loader: Optional[Callable[..., Any]] = None,
+) -> Dict[str, Any]:
+    load = loader if loader is not None else load_joystick_dataset
     records: List[AttemptRecord] = []
     next_pair_id = 0
     control_modes: set[str] = set()
@@ -156,7 +162,7 @@ def build_day_co_structured(repo_root: Path, day: str, recs: Sequence[int]) -> D
     for rec in recs:
         rec_str = f"{int(rec):03d}"
         try:
-            dataset = load_joystick_dataset(repo_root, day, rec_str)
+            dataset = load(repo_root, day, rec_str)
         except Exception as exc:  # noqa: BLE001 - a bad rec must not kill the day
             print(f"  cross_day_co_structured: could not load {day}/{rec_str} ({exc}); skipping")
             continue
@@ -253,17 +259,21 @@ def generate_cross_day_co_structured(
     repo_root: str | Path,
     selections: Sequence[str | Sequence[str]],
     out_dir: str | Path | None = None,
+    rows: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     repo_root_path = Path(repo_root).resolve()
     out_dir_path = Path(out_dir).resolve() if out_dir is not None else _default_out_dir(repo_root_path)
     out_dir_path.mkdir(parents=True, exist_ok=True)
 
-    parsed = [_parse_day_rec_selection(spec, repo_root_path) for spec in selections]
-    rows = [
-        build_day_co_structured(repo_root_path, day=day, recs=recs)
-        for day, recs in parsed
-    ]
-    rows.sort(key=lambda r: r["day"])
+    # The orchestrator builds every day's rows in one pass over the data and
+    # passes them in; standalone callers still build their own.
+    if rows is None:
+        parsed = [_parse_day_rec_selection(spec, repo_root_path) for spec in selections]
+        rows = [
+            build_day_co_structured(repo_root_path, day=day, recs=recs)
+            for day, recs in parsed
+        ]
+    rows = sorted(rows, key=lambda r: r["day"])
 
     figure_path = out_dir_path / "cross_day_co_structured.png"
     json_path = out_dir_path / "cross_day_co_structured_metrics.json"

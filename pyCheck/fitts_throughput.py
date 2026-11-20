@@ -60,7 +60,7 @@ import csv
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -247,7 +247,9 @@ def build_day_throughput(
     requested_task_types: set[str],
     min_attempts_per_bin: int = 8,
     n_grid_distance_bins: int = 4,
+    loader: Optional[Callable[..., Any]] = None,
 ) -> Dict[str, Any]:
+    load = loader if loader is not None else load_joystick_dataset
     co_samples_by_target: Dict[int, List[FittsSample]] = {}
     grid_samples: List[FittsSample] = []
     grid_samples_by_target: Dict[int, List[FittsSample]] = {}
@@ -258,7 +260,7 @@ def build_day_throughput(
     for rec in recs:
         rec_str = f"{int(rec):03d}"
         try:
-            dataset = load_joystick_dataset(repo_root, day, rec_str)
+            dataset = load(repo_root, day, rec_str)
         except Exception as exc:  # noqa: BLE001
             print(f"  fitts_throughput: could not load {day}/{rec_str} ({exc}); skipping")
             continue
@@ -366,16 +368,20 @@ def generate_cross_day_throughput(
     selections: Sequence[str | Sequence[str]],
     out_dir: str | Path | None = None,
     task_types: Optional[Sequence[str]] = None,
+    rows: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     repo_root_path = Path(repo_root).resolve()
     out_dir_path = Path(out_dir).resolve() if out_dir is not None else _default_out_dir(repo_root_path)
     out_dir_path.mkdir(parents=True, exist_ok=True)
     requested = {str(t).strip().lower() for t in (task_types or []) if str(t).strip()}
 
-    parsed = [_parse_day_rec_selection(spec, repo_root_path) for spec in selections]
-    rows = [build_day_throughput(repo_root_path, day=day, recs=recs, requested_task_types=requested)
-            for day, recs in parsed]
-    rows.sort(key=lambda r: r["day"])
+    # The orchestrator builds every day's rows in one pass over the data and
+    # passes them in; standalone callers still build their own.
+    if rows is None:
+        parsed = [_parse_day_rec_selection(spec, repo_root_path) for spec in selections]
+        rows = [build_day_throughput(repo_root_path, day=day, recs=recs, requested_task_types=requested)
+                for day, recs in parsed]
+    rows = sorted(rows, key=lambda r: r["day"])
 
     figure_path = out_dir_path / "cross_day_throughput.png"
     json_path = out_dir_path / "cross_day_throughput_metrics.json"

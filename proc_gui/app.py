@@ -288,16 +288,15 @@ class ProcGuiWindow(QMainWindow):
                 "Generate the full day-level summary figure set.\n\n"
                 "Uses: Task Types, Exclude Recs, Day Dir, and Out Dir.\n\n"
                 "Outputs:\n"
-                f"- <day>_overview_by_rec.png: trial count and success rate for each recording.\n"
-                f"- <day>_performance_over_time.png: rolling success and trial duration across the session.\n"
+                f"Day level, at the top of the output directory:\n"
+                f"- <day>_overview_by_rec.png: trial count per recording coloured by task, with success rate.\n"
                 f"- <day>_display_alignment.png: display latency (photodiode vs task target_on, read straight from the behave file) distribution and per-recording alignment.\n"
-                f"- <day>_target_performance.png: spatial target success map and target usage density.\n"
-                f"- <day>_success_failure_timing.png: timing histograms for success vs failure.\n"
-                f"- <day>_kinematic_intervals.png: reaction time, movement time, and hold duration histograms.\n"
-                f"- <day>_failure_modes.png: why failed trials failed (no movement / never acquired / broke hold) per rec.\n"
-                f"- <day>_overshoot_attempts.png: target re-entry rate per rec and attempts-per-trial distribution.\n"
-                f"- <day>_engagement.png: inter-trial interval, cumulative trials vs rewards, and trial rate per rec.\n"
-                f"- <day>_summary_metrics.json: summary values behind the plots.\n\n"
+                f"- <day>_summary_metrics.json: summary values behind every plot, grouped by task.\n\n"
+                f"Per task, in a <task>/ subdirectory and listed below as [<task>]:\n"
+                f"- joystick_intro: performance_over_time, target_performance, success_failure_timing, "
+                f"kinematic_intervals, failure_modes, overshoot_attempts, engagement, and the co_structured set.\n"
+                f"- simple_touch_task: performance (trials, success rate and failure modes per rec) and "
+                f"touch_accuracy (radial error against the acceptance window, plus endpoint scatter).\n\n"
                 "Use this when you want a high-level view of session quality, performance drift, target-specific "
                 "behavior, and display timing."
             ),
@@ -1334,6 +1333,25 @@ class ProcGuiWindow(QMainWindow):
                     found.append((f"[aruco {rec_dir.name}] {image_path.name}", image_path))
         return found
 
+    def _task_figures(self, out_dir: Optional[Path]) -> list[tuple[str, Path]]:
+        """(label, path) for the per-task figures, one directory per task.
+
+        generate_day_presentation_plots partitions a day by canonical task type
+        and writes each task's panels to beh/<task>/, keeping only the day-level
+        figures at the top. A plain listing of beh/ would therefore show none of
+        the joystick or touch panels.
+        """
+        if out_dir is None or not out_dir.is_dir():
+            return []
+        found: list[tuple[str, Path]] = []
+        for task_dir in sorted(out_dir.iterdir()):
+            if not task_dir.is_dir():
+                continue
+            for image_path in sorted(task_dir.iterdir()):
+                if image_path.suffix.lower() in IMAGE_SUFFIXES:
+                    found.append((f"[{task_dir.name}] {image_path.name}", image_path))
+        return found
+
     def refresh_output_browser(self) -> None:
         out_dir = self._out_dir_path()
         self.output_dir_path = out_dir
@@ -1343,6 +1361,7 @@ class ProcGuiWindow(QMainWindow):
         if out_dir is not None and out_dir.exists():
             entries += [(p.name, p) for p in sorted(out_dir.iterdir())
                         if p.suffix.lower() in IMAGE_SUFFIXES]
+            entries += self._task_figures(out_dir)
         if self.include_aruco_checkbox.isChecked():
             entries += self._aruco_figures(self._day_dir_path())
 

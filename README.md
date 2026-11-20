@@ -76,6 +76,24 @@ What it currently supports:
 
 ---
 
+## Re-running part of a day
+
+`run_day_pipeline.py --steps` runs only the named stages, so events and aggregation can be
+regenerated without repeating the expensive extract (behave captures are 0.3-7 GB per rec and the
+video remux is already done):
+
+```bash
+.venv/bin/python py_proc/run_day_pipeline.py \
+  --day-dir /cdz/pesaranlab/data/<MONKEY>/<DAY> \
+  --steps events_nodisplay full_proc save_trials
+```
+
+Valid steps: `extract`, `events_nodisplay`, `detect_display`, `full_proc`, `save_trials`,
+`aruco_calib`. Omitting `--steps` runs them all, as before. Skip `detect_display` only when
+`recNNN.display_corrected.dat` already exists for every rec.
+
+Use the venv python — a bare `python3` has neither the deps nor the project root on `sys.path`.
+
 ## Key Technical Decisions
 
 ### Clock alignment (AlexRig single-clock shortcut)

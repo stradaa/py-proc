@@ -25,6 +25,13 @@ from scipy.io import loadmat
 # python run_day_pipeline.py --day-dir "dir" --rec 005
 
 def _bootstrap_local_package(repo_root: Path):
+    # proc_events imports the sibling top-level packages (pyjoystick, pyCheck),
+    # which only resolve when the project root is importable.  Running this file
+    # directly puts py_proc/ on sys.path, not its parent.
+    project_root = str(repo_root.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
     spec = importlib.util.spec_from_file_location(
         "py_proc",
         repo_root / "__init__.py",
@@ -256,6 +263,17 @@ def main() -> None:
         action="store_true",
         help="Run ArUco calibration but skip its QC/3D figures",
     )
+    parser.add_argument(
+        "--steps",
+        nargs="+",
+        choices=sorted(_ALL_STEPS),
+        default=None,
+        help=(
+            "Only run these steps (default: all). Use this to re-run events and "
+            "aggregation without repeating the expensive extract, e.g. "
+            "--steps events_nodisplay full_proc save_trials"
+        ),
+    )
     args = parser.parse_args()
 
     run_day_pipeline(
@@ -264,6 +282,7 @@ def main() -> None:
         skip_existing_video=args.skip_existing_video,
         no_display=args.no_display,
         rec=args.rec,
+        steps=set(args.steps) if args.steps else None,
         skip_aruco=args.skip_aruco,
         aruco_plots=not args.no_aruco_plots,
     )

@@ -166,6 +166,105 @@ Notes:
 - `day_presentation_plots.py` currently uses `Target` ID for target-wise summaries; some days may not have reliable `TargetAngle` or `TargetLocation` fields.
 - If you want to exclude problematic blocks from the day-level summary, pass them via `--exclude-recs`.
 
+## Per-task day summaries
+
+A day routinely mixes tasks — Eevee runs `Grid (Rust)` joystick and `Simple Touch (Rust)` in the
+same session — and the two share almost no metrics. `generate_day_presentation_plots` therefore
+partitions trials by **canonical** task type (`pyjoystick.tasks.canonical_task_type`, so
+`joystick_intro_rust` and `simple_touch_rust` land on their Python task) and runs one panel set per
+task. `task_summaries.py` is the registry; a task with no registered panels is reported with its
+trial count and skipped rather than rendered as empty joystick axes.
+
+```
+claude/figures/<day>/beh/
+  <day>_overview_by_rec.png        # all tasks: trials per rec, stacked by task
+  <day>_display_alignment.png      # rig property, stays day-level
+  <day>_summary_metrics.json
+  joystick_intro/<day>_joystick_intro_*.png
+  simple_touch_task/<day>_simple_touch_task_*.png
+```
+
+`<day>_overview_by_rec.png` keeps its historical name and location because `proc_gui/app.py` tests
+for exactly that path to decide whether a day has been summarised.
+
+`<day>_summary_metrics.json` is `{day, touch_input_fails, day_overview, display_alignment, tasks:
+{<task>: {...}}}`. Nothing machine-reads it — `cross_day_plots.py` recomputes from `AllTrials.mat`
+and `behav_results` — so the per-task nesting is safe to consume directly.
+
+Day-level, outside the per-task split:
+- **`touch_input_fails`** — joystick trials ended by `fail_on_touch_input`. These are not joystick
+  attempts and can fire back-to-back while the screen is held, so they are excluded from every
+  performance metric and reported on their own. Display alignment keeps them (they still had a
+  target onset).
+- **`display_alignment`** — photodiode vs task `target_on`, a property of the rig rather than a task.
+
+## simple_touch metrics
+
+`simple_touch_metrics.py` supplies the touch panels. The task logs very little — `behav_result` has
+only `presented_target_ids` and `selected_target_id`, identically for the Python and Rust variants —
+so both panels derive what they need from the pipeline output.
+
+**`<day>_simple_touch_task_performance.png`** — trials and success rate per rec, plus a failure-mode
+split. There is no `failure_reason` for this task, but it drops `selected_target_id` entirely on a
+no-start fail, which separates **never acquired** (ran out `start_timeout`) from **released too
+early** (reached `start_acq`, then exceeded `blink_timeout`).
+
+**`<day>_simple_touch_task_touch_accuracy.png`** — radial error between the touch endpoint and the
+target centre, as a histogram, plus endpoint scatter in the target frame so a systematic bias shows
+as an off-centre cloud. The endpoint is the median of `recNNN.scaledhnd.dat` over +/-25 ms around
+`StartAq`, dropping the `-100` no-touch sentinel; the target centre is `AllTrials.TargetLocation`
+(degrees). The acceptance window (`targN_window_size` from `used_values`) is drawn on both panels so
+error reads against the criterion the subject was actually held to.
+
+`AllTrials` stores `StartOn` absolute and every other event relative to it
+(`save_trials.py:8-9`), so `StartAq` is re-based onto `StartOn` before it indexes the `.dat`.
+Skipping that re-base reads the wrong slice of the hand trace and inflates the error without
+failing — on 261028 it turned a 3.4 deg median into 10.5 deg.
+
+### Touch accuracy is not available on Rust task recs
+
+On recs running a Rust task the mapped touch lands tens of degrees from the target even on trials
+the task accepted. `get_touch_transform` (`py_proc/helpers.py:217`) builds the mapping from
+`frame_width`/`frame_height`/`local_to_global_translation_*`, which Thalamus emits in
+`get_canvas_info` (`task_context.py:636-662`) from `self.widget` — on Rust recs that widget is a
+650x508 control window, not the stimulus surface, and its offset changes per session. Python
+`simple_touch_task` recs report 1920x1080 and map correctly.
+
+`frame_is_consistent` detects the disagreement (median error beyond the acceptance window while
+most trials were accepted) and the panel reports `frame_mismatch` instead of a spatial number,
+drawing the touch cloud against the target layout so the offset is visible. Success rate, trial
+counts and failure modes are unaffected and stay valid. Recovering true touch position on Rust recs
+needs the real stimulus-surface geometry, which `canvas_info` does not currently carry.
+
+Note `ReachStart`/`ReachStop` were NaN for every simple_touch trial before 2026-11-03: `proc_reach`
+bailed on `Go` being NaN before reaching its simple_touch branch, and this task never emits a go cue.
+Days processed before that fix need re-running to get touch reach timing.
+
+## Cross-day cost and caching
+
+The cross-day figures are built by four walkers: the summary rows in
+`cross_day_plots.py`, plus `cross_day_kinematics`, `cross_day_co_structured` and
+`fitts_throughput`. Each used to take `(repo_root, selections)` and re-open every rec for itself,
+so one selection cost four full passes over the raw data — measured at 80 rec loads for 20 recs,
+with `json.loads` on `behav_results` alone accounting for over half of each load.
+
+`cross_day_cache.py` holds the two caches that fix this:
+
+- **`DatasetCache`** — `(day, rec) -> JoystickDataset` shared across the four builders within a
+  run. `generate_cross_day_plots` now walks day-major, building all four of a day's rows from one
+  set of loads, and clears the cache between days so peak memory stays at one day's recs.
+- **`DayRowCache`** — the four finished row dicts per day, persisted to
+  `cross_day_row_cache.json` in the output directory under a fingerprint of the inputs: the rec
+  selection, the task filter, and the size and mtime of every file read. Any change to any of
+  those misses the cache and rebuilds that day.
+
+Measured on 12 days: 42.7 s cold (down from ~100 s), 8.7 s when nothing changed, and 13.3 s when
+one new day is added to the twelve. Output is byte-identical to the pre-cache code.
+
+Pass `loader=` to any `build_day_*` to supply datasets; omit it and the builder loads its own, so
+each module still runs standalone. Pass `rows=` to a `generate_cross_day_*` to skip building
+entirely. Bump `CACHE_VERSION` whenever a builder's output changes, or stale rows will be reused.
+
 ## Day behavior metrics
 
 `day_behavior_metrics.py` adds four derived figures (auto-generated by `generate_day_presentation_plots`) that

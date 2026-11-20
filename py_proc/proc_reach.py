@@ -45,16 +45,15 @@ def proc_reach(day, rec, monkeydir, out_suffix=''):
     print(f'  Processing {len(reach_trials)} reach trials')
 
     for itrial in reach_trials:
-        go_t = float(Events['Go'][itrial])
-        if np.isnan(go_t):
-            continue
-
         task_type = _get_task_type(Events, itrial)
 
         # ---- Blink timeout from used values ----------------------------------
         blink = _get_reach_blink(Events, itrial)
 
         # ---- simple_touch_task branch ----------------------------------------
+        # Keyed off StartAq, not Go: simple_touch never emits a go cue, so Go is
+        # always NaN here.  The Go guard below must stay *after* this branch or
+        # every touch trial is skipped before reaching it.
         if task_type == 'simple_touch_task':
             H = loadroshnd(py_pref, Events, itrial, 'StartAq', [-3000, 200])
             if H.shape[1] == 0:
@@ -77,6 +76,10 @@ def proc_reach(day, rec, monkeydir, out_suffix=''):
             continue
 
         # ---- All other reach tasks -------------------------------------------
+        go_t = float(Events['Go'][itrial])
+        if np.isnan(go_t):
+            continue
+
         targaq_t = float(Events['TargAq'][itrial])
         if np.isnan(targaq_t):
             targaqtime = 0.0
